@@ -8,8 +8,10 @@ Parallel work for Windows PowerShell 5.1, in one file:
   stops cleanly instead of killing the process mid-write.
 - **No orphans** - child processes die with the script, even if it's force-closed.
 
-It was pulled out of a separate project, where these pieces were
-debugged against real hangs and deadlocks. It has no dependency on that project.
+It was pulled out of
+[Manga Conversion Script](https://github.com/HalRiveria/Manga-Conversion-Script),
+where these pieces were debugged against real hangs and deadlocks. It has no
+dependency on that project.
 
 Requires Windows and Windows PowerShell 5.1. Nothing to install.
 

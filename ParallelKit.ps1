@@ -5,8 +5,9 @@
 # Read README.md first - the three worker-code rules there are what keep this
 # from deadlocking.
 #
-# Split off from a larger personal project, where these pieces were debugged
-# against real hangs and deadlocks. No dependency on that project.
+# Split off from Manga Conversion Script
+# (https://github.com/HalRiveria/Manga-Conversion-Script), where these pieces
+# were debugged against real hangs and deadlocks. No dependency on that project.
 #
 # Works under Set-StrictMode: job hashtables are read as $job['Name'], never
 # $job.Name, because under strict mode the dot form THROWS for a key that
