@@ -11,6 +11,22 @@ Parallel work for Windows PowerShell 5.1, in one file:
 It was pulled out of a separate project, where these pieces were
 debugged against real hangs and deadlocks. It has no dependency on that project.
 
+Requires Windows and Windows PowerShell 5.1. Nothing to install.
+
+**Contents:** [Setup](#setup) ·
+[Run a list of programs](#run-a-list-of-programs) ·
+[Run PowerShell code in parallel](#run-powershell-code-in-parallel) ·
+[The three rules for worker code](#the-three-rules-for-worker-code) ·
+[Process dispatch with groups](#process-dispatch-with-groups) ·
+[Single processes](#single-processes) · [Messages](#messages) ·
+[Abort](#abort) · [Limits](#limits) · [Testing](#testing)
+
+Which one you want: a flat list of external programs →
+`Invoke-PkProcessBatch`. PowerShell code → `Invoke-PkRunspaceJobs`. Programs
+that come in groups, with something to do when each group is done →
+`Invoke-PkProcessDispatch`. Wrap any of them in `Invoke-PkRun` for graceful
+Ctrl+C.
+
 ## Setup
 
 Copy `ParallelKit.ps1` into your project and dot-source it:
@@ -30,8 +46,6 @@ up child-process cleanup and sizes the thread pool up front; the engines set
 up what they need on first use either way. It returns
 `@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part
 worked (a part that fails also prints a warning).
-
-`ParallelKit.Harness.ps1` is the test suite. It isn't needed at runtime.
 
 ## Run a list of programs
 
@@ -261,6 +275,21 @@ adds your own `CancellationTokenSource` to the set an abort cancels (a
   returns it can carry on to the end of its script. Before any step that can't
   be undone (deleting a source file, say), have the worker check
   `Test-PkCancelRequested` and skip the step if it's true.
+
+## Testing
+
+`ParallelKit.Harness.ps1` is the test suite. It isn't needed at runtime.
+Run it in a fresh window (see "Limits" above):
+
+```powershell
+powershell -NoProfile -File .\ParallelKit.Harness.ps1
+```
+
+It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with
+nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line
+per check and exits 0 only if everything passed. A few
+`message handler failed` lines in the output are expected: some checks
+break the message handler on purpose to test the fallback.
 
 ## License
 

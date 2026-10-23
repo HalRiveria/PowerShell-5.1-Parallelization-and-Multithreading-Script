@@ -936,8 +936,8 @@ function Invoke-PkProcessDispatchCore {
                 $job['SlotReleased'] = $true
                 # Whatever JobFinalize queued (a retry, follow-up steps) is counted
                 # into its group HERE, by looking at the queue - not by trusting a
-                # returned flag. A flag with nothing queued used to hang the group
-                # forever; two follow-ups used to let it finish early.
+                # returned flag. A flag with nothing queued would hang the group
+                # forever; two follow-ups would let it finish early.
                 # Only when the queue actually grew - walking it on every finished
                 # job would cost a full pass over a large batch each time.
                 if ($pending.Count -gt $pendingBefore) {
@@ -1003,8 +1003,8 @@ function Invoke-PkProcessDispatchCore {
                         $job['SlotReleased'] = $true
                         # Whatever JobFinalize queued (a retry, follow-up steps) is counted
                         # into its group HERE, by looking at the queue - not by trusting a
-                        # returned flag. A flag with nothing queued used to hang the group
-                        # forever; two follow-ups used to let it finish early.
+                        # returned flag. A flag with nothing queued would hang the group
+                        # forever; two follow-ups would let it finish early.
                         # Only when the queue actually grew - walking it on every finished
                         # job would cost a full pass over a large batch each time.
                         if ($pending.Count -gt $pendingBefore) {
@@ -1056,8 +1056,8 @@ function Invoke-PkProcessDispatchCore {
                         $job['SlotReleased'] = $true
                         # Whatever JobFinalize queued (a retry, follow-up steps) is counted
                         # into its group HERE, by looking at the queue - not by trusting a
-                        # returned flag. A flag with nothing queued used to hang the group
-                        # forever; two follow-ups used to let it finish early.
+                        # returned flag. A flag with nothing queued would hang the group
+                        # forever; two follow-ups would let it finish early.
                         # Only when the queue actually grew - walking it on every finished
                         # job would cost a full pass over a large batch each time.
                         if ($pending.Count -gt $pendingBefore) {

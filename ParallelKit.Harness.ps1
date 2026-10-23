@@ -614,7 +614,7 @@ if ($quickEditBefore -eq 1) {
 Write-Host ""
 
 # ==============================================================================
-Write-Host "=== P: second review fixes ===" -ForegroundColor Cyan
+Write-Host "=== P: edge cases - delegate detection, self-setup, careless callbacks ===" -ForegroundColor Cyan
 Reset-Harness
 
 # The safety check sees scriptblocks handed straight to .NET.
@@ -719,15 +719,16 @@ Test-Assert ($threw -and $ran.Count -eq 0) ("a bad key in -JobParams is reported
 Write-Host ""
 
 # ==============================================================================
-Write-Host "=== Q: third review fixes ===" -ForegroundColor Cyan
+Write-Host "=== Q: edge cases - follow-up jobs, re-queued jobs, -JobParams shapes ===" -ForegroundColor Cyan
 
-# "Requeued" returned with nothing actually queued must not hang the group.
+# The dispatcher counts what JobFinalize queued, not what it returns: a
+# return value claiming a requeue, with nothing queued, must not hang the group.
 Reset-Harness
 $done = @{ Groups = 0; Jobs = 0 }
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $d = Invoke-HarnessOneGroupDispatch -Done $done -JobStarter $null -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job; $done.Jobs++; return @{ Requeued = $true } }.GetNewClosure()
 $sw.Stop()
-Test-Assert ($done.Groups -eq 1 -and $sw.Elapsed.TotalSeconds -lt 10) "a JobFinalize that says Requeued but queued nothing no longer hangs the dispatcher"
+Test-Assert ($done.Groups -eq 1 -and $sw.Elapsed.TotalSeconds -lt 10) "a JobFinalize return value is ignored - claiming a requeue with nothing queued doesn't hang the dispatcher"
 
 # Two follow-up jobs, no flag: the group completes only after ALL of them.
 Reset-Harness
@@ -792,7 +793,7 @@ $bigBudget.Dispose()
 Write-Host ""
 
 # ==============================================================================
-Write-Host "=== R: fourth review fixes ===" -ForegroundColor Cyan
+Write-Host "=== R: edge cases - group identity, .Group, large batches ===" -ForegroundColor Cyan
 
 # Two groups that compare equal keep separate job counts.
 Reset-Harness
@@ -859,7 +860,7 @@ Test-Assert ($sw.Elapsed.TotalSeconds -lt 15) ("and the dispatcher's own bookkee
 Write-Host ""
 
 # ==============================================================================
-Write-Host "=== S: fifth review fixes ===" -ForegroundColor Cyan
+Write-Host "=== S: edge cases - abort timing, strict mode, stale types, sleep, -IgnoreAbort ===" -ForegroundColor Cyan
 
 # Invoke-PkProcessWithTimeout stops promptly on an abort. The abort is
 # raised from another thread while the main thread is inside the wait.
@@ -980,7 +981,7 @@ Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'ScriptVariable') "`$script: ins
 Write-Host ""
 
 # ==============================================================================
-Write-Host "=== T: release review fixes ===" -ForegroundColor Cyan
+Write-Host "=== T: edge cases - tokens in workers, batch result fields, aborted groups ===" -ForegroundColor Cyan
 Reset-Harness
 # A dispatcher inside a worker, given a token of the worker's own making,
 # must still stop on an abort - not run its processes to the end.
