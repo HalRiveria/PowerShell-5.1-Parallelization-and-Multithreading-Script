@@ -17,7 +17,7 @@ Copy `ParallelKit.ps1` into your project and dot-source it:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
-Initialize-ParallelKit -MaxConcurrentProcesses 8
+$null = Initialize-ParallelKit -MaxConcurrentProcesses 8
 ```
 
 It works whether or not your script uses `Set-StrictMode`.
@@ -25,9 +25,11 @@ It works whether or not your script uses `Set-StrictMode`.
 Dot-source it; don't `Import-Module` it. As a module it couldn't see the
 functions you list in `-SharedFunctionNames`.
 
-`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler and
-sizes the thread pool up front; the engines set up what they need on first
-use either way.
+`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets
+up child-process cleanup and sizes the thread pool up front; the engines set
+up what they need on first use either way. It returns
+`@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part
+worked (a part that fails also prints a warning).
 
 `ParallelKit.Harness.ps1` is the test suite. It isn't needed at runtime.
 
@@ -45,7 +47,20 @@ $batch = Invoke-PkRun {
 }
 ```
 
-Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`.
+`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`.
+Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`,
+with every field always present:
+
+- `Command` is your original command hashtable, so extra keys like `Source`
+  above come back with it.
+- `StartError` is set when the program couldn't be started (not found, say).
+- `Aborted` is `$true` for a command an abort killed or kept from starting.
+- `StreamTimedOut` / `StreamError` mean the output may be incomplete. The
+  output read gives up 15 seconds after the program exits, which only
+  happens when a program it started is still holding the output open.
+
+`-OnComplete` runs only for commands that actually ran. Check `Results` for
+the ones that couldn't start or were aborted.
 
 `Invoke-PkRun { ... }` is what makes Ctrl+C graceful. It also stops the PC
 idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the
@@ -133,6 +148,10 @@ Invoke-PkProcessDispatch -MaxConcurrent 6 `
     -GroupCompleteCallback { param($group)  <# e.g. zip the folder #> }
 ```
 
+- **`-GroupCompleteCallback` also runs for a group an abort cut short**, so
+  you can record the jobs in it that did finish. Before doing anything
+  irreversible there (zipping the folder, deleting sources), check
+  `Test-PkCancelRequested` (or your own `-CancelToken`) and skip it if true.
 - Groups are pulled lazily, at most `-MaxQueueAhead` (default 3) ahead.
 - A group can be any value: a hashtable, a path, a name. Each job gets its
   group as `$job.Group`.
@@ -153,10 +172,19 @@ Invoke-PkProcessDispatch -MaxConcurrent 6 `
   jobs can each run a dispatcher against one shared budget.
 - `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its
   queue-ahead slot until the check returns true. Use it to stop one dispatcher
-  racing ahead of another that it's paired with.
+  racing ahead of another that it's paired with. The dispatcher doesn't
+  return until every held group has been released.
+- `-JobPollCompleted { param($job) }` replaces the default "has the process
+  exited" check, for a custom starter whose job isn't a plain process.
+- `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with
+  the jobs currently running.
+- `-CancelToken` stops the dispatcher when cancelled. An abort stops it
+  either way, without cancelling your token.
 - An exception from one of your callbacks stops the dispatcher: running
   processes are killed and the exception is rethrown.
 - Returns `@{ GroupResults; Aborted; ForceKilledCount; JobStarterFailedCount }`.
+  `GroupResults` holds one `@{ GroupInfo; Completed; Aborted }` per group,
+  where `GroupInfo` is the group value.
 
 Closures: build every callback that uses your local variables with
 `{ ... }.GetNewClosure()`. Without it, a variable name that happens to match
@@ -168,10 +196,12 @@ inside a closure doesn't stick between calls.
 
 | Function | Use |
 |---|---|
-| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit. Also stops it if the run is aborted; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
-| `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. |
-| `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. |
-| `Complete-PkProcess -Job` | Collect exit code and output from a finished one. |
+| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns `@{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError }`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
+| `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
+| `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
+| `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
+
+`Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
 All four are safe in worker code.
 
@@ -231,3 +261,7 @@ adds your own `CancellationTokenSource` to the set an abort cancels (a
   returns it can carry on to the end of its script. Before any step that can't
   be undone (deleting a source file, say), have the worker check
   `Test-PkCancelRequested` and skip the step if it's true.
+
+## License
+
+MIT - see `LICENSE`.

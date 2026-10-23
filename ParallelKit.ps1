@@ -5,8 +5,8 @@
 # Read README.md first - the three worker-code rules there are what keep this
 # from deadlocking.
 #
-# Extracted from the Conversion Script project's ZipParallelProcessing.ps1,
-# ChapterDispatch.ps1 and AbortPipeline.ps1. No dependency on that project.
+# Split off from a larger personal project, where these pieces were debugged
+# against real hangs and deadlocks. No dependency on that project.
 #
 # Works under Set-StrictMode: job hashtables are read as $job['Name'], never
 # $job.Name, because under strict mode the dot form THROWS for a key that
@@ -97,7 +97,8 @@ public static class PkState
     // Bump this whenever any C# in this file changes. A PowerShell session
     // keeps compiled types until it exits, so re-loading an edited kit into
     // an old session would silently run the OLD C# - the check after the
-    // type definitions catches that.
+    // type definitions catches that. That check compares against this
+    // number too; bump both together.
     public const int TypesVersion = 3;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
@@ -271,7 +272,8 @@ public static class PkChildProcessJob
 
 # A session that loaded an earlier copy of this file still has that copy's
 # compiled types, and they can't be replaced. Say so, instead of failing
-# later with a missing-method error somewhere unrelated.
+# later with a missing-method error somewhere unrelated. Keep this number
+# in sync with [PkState]::TypesVersion above.
 if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 3) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
@@ -752,11 +754,15 @@ function Invoke-PkProcessDispatch {
             Register-PkCancellationSource -Cts $ownCts
             $CancelToken = $ownCts.Token
         }
-    } elseif ($null -eq $global:PkWorkerQueue) {
-        # The caller's own token, on the main thread: nothing would cancel
-        # it on Ctrl+C. Run on a linked source that an abort DOES cancel
-        # (and that still follows the caller's token).
-        $ownCts = [System.Threading.CancellationTokenSource]::CreateLinkedTokenSource([System.Threading.CancellationToken[]]@($CancelToken))
+    } else {
+        # The caller's own token: nothing would cancel it on Ctrl+C. Run on
+        # a linked source that an abort DOES cancel (and that still follows
+        # the caller's token). In a worker it also follows the run's token,
+        # so the run being cancelled for any reason stops this dispatcher.
+        $linkTokens = [System.Collections.Generic.List[System.Threading.CancellationToken]]::new()
+        $linkTokens.Add($CancelToken)
+        if ($null -ne $global:PkCancelToken) { $linkTokens.Add($global:PkCancelToken) }
+        $ownCts = [System.Threading.CancellationTokenSource]::CreateLinkedTokenSource($linkTokens.ToArray())
         Register-PkCancellationSource -Cts $ownCts
         $CancelToken = $ownCts.Token
     }
@@ -1143,9 +1149,11 @@ function Invoke-PkProcessDispatchCore {
 function Invoke-PkProcessBatch {
     # The simple case: run a flat list of commands, $MaxConcurrent at a time.
     # Each command is @{ FilePath = ...; Arguments = ...; WorkingDirectory = ... (optional); <anything else> }.
-    # $OnComplete { param($command, $result) } fires as each one finishes.
+    # $OnComplete { param($command, $result) } fires as each one finishes
+    # (not for one that couldn't start or was stopped by an abort).
     # Returns @{ Results; Aborted; ForceKilledCount }; each result is
-    # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StartError; Aborted }.
+    # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted },
+    # every field always present - keep the three places that build one in sync.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -1176,7 +1184,7 @@ function Invoke-PkProcessBatch {
         try {
             $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory']
         } catch {
-            $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StartError = [string]$_; Aborted = $false })
+            $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = [string]$_; Aborted = $false })
             throw
         }
         $job['Proc'] = $started.Proc; $job['StdoutTask'] = $started.StdoutTask; $job['StderrTask'] = $started.StderrTask
@@ -1194,7 +1202,7 @@ function Invoke-PkProcessBatch {
 
     $jobAbortCleanup = {
         param($job)
-        $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StartError = $null; Aborted = $true })
+        $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = $null; Aborted = $true })
     }.GetNewClosure()
 
     $dispatch = Invoke-PkProcessDispatch -GroupProvider $groupProvider -JobBuilder $jobBuilder -JobStarter $jobStarter `

@@ -800,13 +800,13 @@ $feed = @{ Index = 0 }
 $order = [System.Collections.Generic.List[string]]::new()
 $groupsSeen = [System.Collections.Generic.List[object]]::new()
 $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -MaxQueueAhead 2 `
-    -GroupProvider { if ($feed.Index -ge 2) { return $null }; $feed.Index++; return 'Chapter 1' }.GetNewClosure() `
+    -GroupProvider { if ($feed.Index -ge 2) { return $null }; $feed.Index++; return 'Group 1' }.GetNewClosure() `
     -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' }) }.GetNewClosure() `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job; $order.Add('job'); $groupsSeen.Add($job.Group) }.GetNewClosure() `
     -GroupCompleteCallback { param($group) $order.Add('group') }.GetNewClosure()
 Test-Assert (($order -join ',') -eq 'job,job,group,job,job,group') ("two groups with the same name each complete after their own two jobs (order: " + ($order -join ',') + ")")
 Test-Assert ($d.GroupResults.Count -eq 2) "and both are reported"
-Test-Assert ($groupsSeen.Count -eq 4 -and @($groupsSeen | Where-Object { $_ -ne 'Chapter 1' }).Count -eq 0) "each job carries its group value as .Group"
+Test-Assert ($groupsSeen.Count -eq 4 -and @($groupsSeen | Where-Object { $_ -ne 'Group 1' }).Count -eq 0) "each job carries its group value as .Group"
 
 # A follow-up job inherits .Group as well as its place in the group.
 Reset-Harness
@@ -977,6 +977,66 @@ Test-Assert ($groupsSeen.Count -eq 2 -and ($groupsSeen -contains 'mine') -and ($
 # The safety check looks inside functions defined in the worker script.
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) function Get-Inner { return $script:cache }; $script:top = 1; return (Get-Inner) }
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'ScriptVariable') "`$script: inside a function defined in the worker script is flagged (the worker's own top level still isn't)"
+Write-Host ""
+
+# ==============================================================================
+Write-Host "=== T: release review fixes ===" -ForegroundColor Cyan
+Reset-Harness
+# A dispatcher inside a worker, given a token of the worker's own making,
+# must still stop on an abort - not run its processes to the end.
+$ownTokenEngine = {
+    param([string]$PingExe)
+    $mineInWorker = [System.Threading.CancellationTokenSource]::new()
+    $feed = @{ Given = $false }
+    $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 -CancelToken $mineInWorker.Token `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $PingExe; Arguments = '-n 30 127.0.0.1' }, @{ FilePath = $PingExe; Arguments = '-n 30 127.0.0.1' }) }.GetNewClosure() `
+        -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job }
+    return @{ Aborted = $d.Aborted; OwnCancelled = $mineInWorker.IsCancellationRequested }
+}
+$results = [System.Collections.Generic.List[hashtable]]::new()
+$poll = @{ Count = 0 }
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$out = Invoke-PkRunspaceJobs -WorkerScript $ownTokenEngine -JobParams @{ PingExe = $pingExe } -MaxParallel 1 -DrainTimeoutSeconds 20 `
+    -ResultHandler { param($r) $results.Add($r) }.GetNewClosure() `
+    -PollCallback { $poll.Count++; if ($poll.Count -eq 15) { Request-PkAbort } }.GetNewClosure()
+$sw.Stop()
+Test-Assert ($out.ForceStoppedCount -eq 0 -and $results.Count -eq 1 -and $results[0].Aborted) ("a dispatcher in a worker with its own -CancelToken stops on an abort (force-stopped " + $out.ForceStoppedCount + ", " + [int]$sw.Elapsed.TotalSeconds + "s)")
+Test-Assert ($results.Count -eq 1 -and -not $results[0].OwnCancelled) "without cancelling the worker's own token"
+Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
+
+# Every batch result has every documented field, so a strict-mode caller
+# can read any of them without a "property cannot be found" error.
+Reset-Harness
+$fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted')
+$batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
+    @{ FilePath = $cmdExe; Arguments = '/c exit 0' },
+    @{ FilePath = 'C:\definitely\not\here.exe' })
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+Test-Assert ($batch.Results.Count -eq 2 -and @($missing).Count -eq 0) ("batch results for a finished and an unstartable command carry every field (missing: " + (@($missing) -join ', ') + ")")
+
+# An abort already in force: nothing starts, every command comes back Aborted.
+Reset-Harness
+Request-PkAbort
+$batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' })
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+Test-Assert ($batch.Aborted -and $batch.Results.Count -eq 2 -and @($batch.Results | Where-Object { $_.Aborted }).Count -eq 2) "batch: commands an abort kept from starting come back marked Aborted"
+Test-Assert (@($missing).Count -eq 0) ("and their results carry every field too (missing: " + (@($missing) -join ', ') + ")")
+Reset-PkAbortState
+
+# An aborted group still gets -GroupCompleteCallback (the README warns about
+# this - a caller zipping a folder there must check for the abort first).
+Reset-Harness
+Request-PkAbort
+$called = @{ Count = 0; SawAbort = $false }
+$feed = @{ Given = $false }
+$d = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+    -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+    -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) }.GetNewClosure() `
+    -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
+    -GroupCompleteCallback { param($g) $called.Count++; $called.SawAbort = [bool](Test-PkCancelRequested) }.GetNewClosure()
+Test-Assert ($d.Aborted -and $called.Count -eq 1 -and $called.SawAbort) "an aborted group still gets its -GroupCompleteCallback, and Test-PkCancelRequested is true inside it"
+Reset-PkAbortState
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
