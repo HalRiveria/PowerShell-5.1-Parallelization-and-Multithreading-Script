@@ -1,6 +1,6 @@
 # ParallelKit
 
-[![Tests](https://github.com/HalRiveria/PowerShell-5.1-Parallelization-and-Multithreading-Script/actions/workflows/tests.yml/badge.svg)](https://github.com/HalRiveria/PowerShell-5.1-Parallelization-and-Multithreading-Script/actions/workflows/tests.yml)
+[![Tests](https://github.com/HalRiveria/PowerShell-ParallelKit/actions/workflows/tests.yml/badge.svg)](https://github.com/HalRiveria/PowerShell-ParallelKit/actions/workflows/tests.yml)
 
 Run thousands of command-line programs, or blocks of PowerShell code, in parallel from Windows PowerShell 5.1, and stop cleanly when you press Ctrl+C. One file, nothing to install.
 
@@ -13,7 +13,26 @@ It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Man
 
 Built with Claude Code.
 
-**Contents:** [Who it's for](#who-its-for) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing)
+**Contents:** [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing)
+
+## Quick start
+
+Most uses are this: a list of command-line programs, run a few at a time, where Ctrl+C lets the running ones finish instead of cutting them off.
+
+```powershell
+. "$PSScriptRoot\ParallelKit.ps1"
+
+$commands = foreach ($f in Get-ChildItem *.png) {
+    @{ FilePath = 'cjxl.exe'; Arguments = ('"{0}" "{0}.jxl"' -f $f.FullName) }
+}
+$batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
+
+foreach ($r in $batch.Results) {
+    if ($r.ExitCode -ne 0) { Write-Warning ('Failed: ' + $r.Command.Arguments) }
+}
+```
+
+That's all you need for this case. The worker rules, closures and callback details further down don't apply to it: they only matter for running PowerShell code in parallel (`Invoke-PkRunspaceJobs`) or for the group dispatcher. [Run a list of programs](#run-a-list-of-programs) covers the result fields and options.
 
 ## Who it's for
 
@@ -63,15 +82,20 @@ Each public function has a comment block at the top of its definition in `Parall
 ```powershell
 # Any command-line tool works. cjxl is a JPEG XL image encoder.
 $commands = foreach ($f in Get-ChildItem *.png) {
-    @{ FilePath = "cjxl.exe"; Arguments = "`"$($f.FullName)`" `"$($f.FullName).jxl`""; Source = $f }
+    @{ FilePath = 'cjxl.exe'; Arguments = ('"{0}" "{0}.jxl"' -f $f.FullName); Source = $f }
 }
-$batch = Invoke-PkRun {
-    Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 -OnComplete {
+$batchParams = @{
+    Commands      = $commands
+    MaxConcurrent = 6
+    OnComplete    = {
         param($command, $result)
         if ($result.ExitCode -ne 0) { Write-PkMessage "FAILED: $($command.Source.Name)" -Level Error }
     }
 }
+$batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 ```
+
+Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
 
 Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written, so put quotes around paths that may contain spaces (as above). Programs run hidden, with their output captured.
 
@@ -105,16 +129,20 @@ $jobs = [System.Collections.Generic.List[hashtable]]::new()
 foreach ($f in Get-ChildItem -File) { $jobs.Add(@{ Path = $f.FullName }) }
 $shaByPath = @{}
 
-$out = Invoke-PkRun {
-    Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams $jobs -SharedFunctionNames @('Get-FileSha') -CheckWorkerSafety `
-        -WorkerScript {
-            param([string]$Path)
-            if (Test-PkCancelRequested) { return }
-            Write-PkMessage "hashing $Path"
-            return @{ Path = $Path; Sha = (Get-FileSha -Path $Path) }
-        } `
-        -ResultHandler { param($r) $shaByPath[$r.Path] = $r.Sha }.GetNewClosure()
+$jobsParams = @{
+    MaxParallel         = 4
+    JobParams           = $jobs
+    SharedFunctionNames = @('Get-FileSha')
+    CheckWorkerSafety   = $true
+    WorkerScript        = {
+        param([string]$Path)
+        if (Test-PkCancelRequested) { return }
+        Write-PkMessage "hashing $Path"
+        return @{ Path = $Path; Sha = (Get-FileSha -Path $Path) }
+    }
+    ResultHandler       = { param($r) $shaByPath[$r.Path] = $r.Sha }.GetNewClosure()
 }
+$out = Invoke-PkRun { Invoke-PkRunspaceJobs @jobsParams }
 ```
 
 Each worker runs in its own runspace: a separate PowerShell session inside the same process, with its own variables and functions. That separation is what makes running them at the same time safe, and also why a worker can't see your script's variables or functions unless you hand them over.
@@ -131,6 +159,8 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
 
 ## The three rules for worker code
+
+These only apply if you run PowerShell code in parallel with `Invoke-PkRunspaceJobs` (or call a dispatcher from inside one of its workers). Running external programs with `Invoke-PkProcessBatch` or `Invoke-PkProcessDispatch` on the main thread never touches them.
 
 Worker code is the worker script, every function in `-SharedFunctionNames`, and anything they call. Breaking these rules doesn't fail loudly. It hangs, or quietly reads nothing.
 
@@ -155,12 +185,15 @@ Only worker code is affected. Callbacks that run on the main thread (`-ResultHan
 `Invoke-PkProcessBatch` covers a flat list. `Invoke-PkProcessDispatch` is the engine under it, for work that comes in groups (a folder of files, say) where something should happen when each group finishes:
 
 ```powershell
-Invoke-PkProcessDispatch -MaxConcurrent 6 `
-    -GroupProvider         { <# next group object, or $null when done #> } `
-    -JobBuilder            { param($group)  <# hashtable job(s): @{ FilePath; Arguments; WorkingDirectory; ... } #> } `
-    -JobFinalize           { param($job, $pending)  $r = Complete-PkProcess -Job $job; ... } `
-    -JobAbortCleanup       { param($job)  <# delete a killed job's partial output #> } `
-    -GroupCompleteCallback { param($group)  <# e.g. zip the folder #> }
+$dispatchParams = @{
+    MaxConcurrent         = 6
+    GroupProvider         = { <# next group object, or $null when done #> }
+    JobBuilder            = { param($group)  <# hashtable job(s): @{ FilePath; Arguments; WorkingDirectory; ... } #> }
+    JobFinalize           = { param($job, $pending)  $r = Complete-PkProcess -Job $job; <# ... #> }
+    JobAbortCleanup       = { param($job)  <# delete a killed job's partial output #> }
+    GroupCompleteCallback = { param($group)  <# e.g. zip the folder #> }
+}
+$dispatch = Invoke-PkProcessDispatch @dispatchParams
 ```
 
 All of these callbacks run on whichever thread called the dispatcher: the main thread normally, or the worker if you call it from inside a runspace job (in which case the worker rules apply to them).
