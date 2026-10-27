@@ -1155,8 +1155,11 @@ function Invoke-PkProcessBatch {
     # Returns @{ Results; Aborted; ForceKilledCount }; each result is
     # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted },
     # every field always present - keep the three places that build one in sync.
+    # $Commands may be $null: a foreach that matches nothing yields $null, not
+    # an empty array, and an empty batch should just return no results.
     param(
         [Parameter(Mandatory)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [hashtable[]]$Commands,
         [int]$MaxConcurrent = 4,
@@ -1176,7 +1179,10 @@ function Invoke-PkProcessBatch {
     $jobBuilder = {
         param($group)
         $jobs = [System.Collections.Generic.List[hashtable]]::new()
-        foreach ($c in $Commands) { $jobs.Add(@{ FilePath = $c['FilePath']; Arguments = [string]$c['Arguments']; WorkingDirectory = [string]$c['WorkingDirectory']; Command = $c }) }
+        foreach ($c in $Commands) {
+            if ($null -eq $c) { continue }
+            $jobs.Add(@{ FilePath = $c['FilePath']; Arguments = [string]$c['Arguments']; WorkingDirectory = [string]$c['WorkingDirectory']; Command = $c })
+        }
         return $jobs
     }.GetNewClosure()
 
