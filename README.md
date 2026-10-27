@@ -8,20 +8,14 @@ Parallel work for Windows PowerShell 5.1, in one file:
 - **No orphans** - child processes die with the script, even if it's force-closed.
 
 It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Manga-Conversion-Script), but has no dependencies on that project.
+
 Built with Claude.
 
 Requires Windows and Windows PowerShell 5.1. Nothing to install.
 
-**Contents:** [Setup](#setup) ·
-[Run a list of programs](#run-a-list-of-programs) ·
-[Run PowerShell code in parallel](#run-powershell-code-in-parallel) ·
-[The three rules for worker code](#the-three-rules-for-worker-code) ·
-[Process dispatch with groups](#process-dispatch-with-groups) ·
-[Single processes](#single-processes) · [Messages](#messages) ·
-[Abort](#abort) · [Limits](#limits) · [Testing](#testing)
+**Contents:** [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Limits](#limits) · [Testing](#testing)
 
-Which one you want: a flat list of external programs →
-`Invoke-PkProcessBatch`. PowerShell code → `Invoke-PkRunspaceJobs`. Programs that come in groups, with something to do when each group is done → `Invoke-PkProcessDispatch`. Wrap any of them in `Invoke-PkRun` for graceful Ctrl+C.
+Which one you want: a flat list of external programs → `Invoke-PkProcessBatch`. PowerShell code → `Invoke-PkRunspaceJobs`. Programs that come in groups, with something to do when each group is done → `Invoke-PkProcessDispatch`. Wrap any of them in `Invoke-PkRun` for graceful Ctrl+C.
 
 ## Setup
 
@@ -52,8 +46,7 @@ $batch = Invoke-PkRun {
 }
 ```
 
-`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`.
-Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`, with every field always present:
+`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`, with every field always present:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `StartError` is set when the program couldn't be started (not found, say).
@@ -86,7 +79,7 @@ $out = Invoke-PkRun {
 ```
 
 - Each job hashtable's keys become the worker's parameters.
-- `-JobParams` takes a list or array of job hashtables. A single hashtable   works too, so a list that happens to hold one job is fine.
+- `-JobParams` takes a list or array of job hashtables. A single hashtable works too, so a list that happens to hold one job is fine.
 - A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there.
 - Whatever the worker returns is handed to `-ResultHandler` on the main thread.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily.
