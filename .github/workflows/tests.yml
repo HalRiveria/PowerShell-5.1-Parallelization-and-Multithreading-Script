@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    name: Harness
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows PowerShell 5.1 (shell: powershell), the version the kit targets.
+      # A fresh powershell.exe so the kit's compiled types load clean.
+      - name: Run ParallelKit.Harness.ps1
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ParallelKit.Harness.ps1
+          exit $LASTEXITCODE
