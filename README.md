@@ -1,5 +1,7 @@
 # ParallelKit
 
+[![Tests](https://github.com/HalRiveria/PowerShell-5.1-Parallelization-and-Multithreading-Script/actions/workflows/tests.yml/badge.svg)](https://github.com/HalRiveria/PowerShell-5.1-Parallelization-and-Multithreading-Script/actions/workflows/tests.yml)
+
 Run thousands of command-line programs, or blocks of PowerShell code, in parallel from Windows PowerShell 5.1, and stop cleanly when you press Ctrl+C. One file, nothing to install.
 
 - **Process dispatch** - run many external programs, a set number at a time, with their output captured.
@@ -249,6 +251,8 @@ powershell -NoProfile -File .\ParallelKit.Harness.ps1
 ```
 
 It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
+
+GitHub runs the same harness on Windows PowerShell 5.1 for every pull request and every change to `main`.
 
 ## License
 
