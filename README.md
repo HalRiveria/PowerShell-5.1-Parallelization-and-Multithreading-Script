@@ -6,14 +6,14 @@ Run thousands of command-line programs, or blocks of PowerShell code, in paralle
 
 - **Process dispatch** - run many external programs, a set number at a time, with their output captured.
 - **Runspace jobs** - run a PowerShell worker script many times in parallel.
-- **Graceful abort** - Ctrl+C or closing the window lets in-flight work finish and stops cleanly, instead of killing everything mid-write.
+- **Graceful abort** - Ctrl+C lets in-flight work finish and stops cleanly, instead of killing everything mid-write. Closing the window stops what's left straight away, since Windows allows only a few seconds.
 - **No orphans** - programs the script started die with it, even if it's force-closed.
 
 It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Manga-Conversion-Script), but has no dependencies on that project.
 
 Built with Claude Code.
 
-**Contents:** [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing)
+**Contents:** [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Why Not Use X?](#why-not-use-x) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing) · [FAQ](#faq)
 
 ## Quick start
 
@@ -36,11 +36,11 @@ That's all you need for this case. The worker rules, closures and callback detai
 
 ## Who it's for
 
-Scripts that have to run on Windows PowerShell 5.1, the version built into every Windows 10, Windows 11 and Windows Server install. Usually that's because PowerShell 7 isn't installed or isn't allowed on the machines involved, or because the script has to run anywhere without asking anyone to install anything.
+Scripts that have to run on Windows PowerShell 5.1, the version built into Windows 10 (1607 and later), Windows 11 and Windows Server 2016 and later. Usually that's because PowerShell 7 isn't installed or isn't allowed on the machines involved, or because the script has to run anywhere without asking anyone to install anything.
 
 The typical job is batch work over lots of files with a command-line tool: converting images, audio or video, compressing archives, running a check or build step per file. That's what the process side is built for, and it's where most of the kit's care has gone.
 
-If PowerShell 7 is an option, `ForEach-Object -Parallel` covers simple parallel loops. On 5.1, the ThreadJob module is simpler for running plain scriptblocks in parallel. Reach for ParallelKit when you also need any of these:
+For plain parallel loops of PowerShell code, other tools are simpler (see [Why Not Use X?](#why-not-use-x)). Reach for ParallelKit when you need any of these:
 
 - Ctrl+C that lets running work finish instead of cutting it off mid-file.
 - Child processes that are cleaned up even if the script is killed outright.
@@ -56,7 +56,27 @@ Which function you want:
 | PowerShell code to run in parallel | `Invoke-PkRunspaceJobs` |
 | One program to run with a time limit | `Invoke-PkProcessWithTimeout` |
 
-Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C.
+Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C. (For `Invoke-PkProcessWithTimeout` that means the program is killed and the call throws, instead of the whole script dying.)
+
+## Why Not Use X?
+
+For running PowerShell code in parallel, most of these are fine and some are simpler. ParallelKit is mainly about running external programs, and about what happens when a run is stopped partway through.
+
+- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer if you can use PowerShell 7. ParallelKit is for scripts and machines that are stuck on 5.1. Why not use PowerShell 7? Because I don't wanna.
+- **`Start-Job`.** Built in, but each job is a whole new `powershell.exe` process, so every job costs noticeable startup time and memory, and what it returns comes back as serialized copies (properties only, no methods). 5.1's `Start-Job` has no throttle either, so you write the wait-for-a-free-slot loop yourself. Fine for a handful of long jobs, poor for thousands of short ones.
+- **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (it ships with PowerShell 7, not 5.1).
+- **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. For this purpose it has the same strengths and gaps as ThreadJob.
+- **A runspace pool by hand** (`[runspacefactory]::CreateRunspacePool`). That's what `Invoke-PkRunspaceJobs` is built on. It works, but you end up writing the polling loop, error collection, cancellation and cleanup yourself, which is most of what this file is.
+- **Workflows (`foreach -parallel`).** Still in 5.1, but they use a restricted version of the language, start slowly, and were dropped from PowerShell 6 and later. Not worth starting anything new on.
+- **`Start-Process` in a loop.** Starts programs without waiting, but can only send their output to files, and the throttling and waiting are up to you. Using `System.Diagnostics.Process` directly gets output into memory, but reading stdout and then stderr the simple way deadlocks once a program fills the pipe you aren't reading. The kit reads both in the background.
+- **`Invoke-Command -AsJob` against localhost.** Needs PowerShell remoting enabled (on by default only on Windows Server), and connecting to your own machine needs an elevated session, all for no gain on one machine.
+
+What none of them do for you:
+
+- On Ctrl+C, let running work finish (up to a time limit), then stop what's left and call your cleanup for each job that was killed. A window close does the same without the wait.
+- Kill the programs your script started if the script itself is killed. Windows doesn't do that on its own: a process's children keep running after it dies.
+- Run external programs directly, with a cap and captured output, instead of tying up a PowerShell thread to wait on each one.
+- Work in groups, with retries and a step when each group finishes.
 
 ## Setup
 
@@ -73,7 +93,7 @@ It works whether or not your script uses `Set-StrictMode`.
 
 Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
 
-`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns `@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part worked (a part that fails also prints a warning).
+`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns `@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
 Each public function has a comment block at the top of its definition in `ParallelKit.ps1` listing its parameters and what it returns. `Get-Help` doesn't show these; read the file.
 
@@ -155,7 +175,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
 - `-JobCrashedHandler { param($err) ... }` is told when a worker throws. That job's result handler isn't called.
-- If one of your main-thread callbacks throws, the run stops: workers still going are told to stop and the exception comes out of the call.
+- If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
 - Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
 
 ## The three rules for worker code
@@ -174,7 +194,7 @@ Only worker code is affected. Callbacks that run on the main thread (`-ResultHan
 
 ### Why these rules exist
 
-"No cmdlets" in PowerShell code sounds extreme, so here's where each rule comes from. All three were found chasing real, intermittent hangs, and none of them is documented by Microsoft.
+"No cmdlets" in PowerShell code sounds extreme, so here's where each rule comes from. All three were found chasing real, intermittent hangs, and none of them is in Microsoft's documentation as far as we could find.
 
 - **Cmdlets.** The first time a cmdlet runs in a fresh runspace, PowerShell 5.1 sets it up, and that setup isn't safe when two runspaces do it at the same moment. With just two workers, the original project hung in roughly 1 run in 8. Every cmdlet tried could trigger it, down to `Start-Sleep` and `Out-Null`. Replacing every cmdlet on the worker side with .NET calls took that to 0 hangs in 50 stress runs. The kit's own worker-side functions follow the same rule.
 - **`$script:` variables.** A function listed in `-SharedFunctionNames` is recreated inside the worker from its source text, so it's no longer attached to your script and its `$script:` points somewhere else. Inside a `.GetNewClosure()` block, `$script:` points at a private copy. Either way the read comes back empty, with no error.
@@ -207,7 +227,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - Supply `-JobStarter { param($job) ... }` to start jobs yourself. It must set `$job.Proc` and should return the job. A starter that is just `Start-PkProcess ...` works too: its result is folded into your job. Throw to report a job that couldn't start.
 - Whatever your callbacks output is thrown away, apart from the return values listed here. They can't corrupt the dispatcher's result by accident.
 - `-MaxConcurrent` can be a `SemaphoreSlim` shared by several dispatchers that must stay under one combined limit. It works inside workers, so two runspace jobs can each run a dispatcher against one shared budget.
-- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released.
+- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is cancelled or aborted.
 - `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process, or to give each job a time limit (see "Limits").
 - `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running.
 - `-CancelToken` stops the dispatcher when cancelled. An abort stops it either way, without cancelling your token.
@@ -255,9 +275,9 @@ Two things to know:
 - **Inside `Invoke-PkRun`, Ctrl+C no longer kills anything by itself.** It only raises a flag. The kit's engines watch that flag. A long step of your own in there has to check `Test-PkAbortSignal` now and then and stop when it's true, or Ctrl+C will seem to do nothing until that step ends.
 - **An abort stays in force until it's reset.** `Invoke-PkRun` resets it at the start of each run. If you call an engine again outside `Invoke-PkRun` after an abort, it returns straight away with `Aborted = $true`. Call `Reset-PkAbortState` first if you mean to carry on.
 
-`Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on, one stray click in the console window starts a text selection, and the script freezes for as long as the selection stays there. That looks exactly like a hang. It's turned back on afterwards if it was on before.
+`Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
 
-Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` or `-CancelToken` you pass to an engine is covered automatically). `Get-PkAbortTriggerLabel` says which kind of abort it was.
+Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
 
 ## Choosing limits
 
@@ -286,6 +306,52 @@ powershell -NoProfile -File .\ParallelKit.Harness.ps1
 It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
 GitHub runs the same harness on Windows PowerShell 5.1 for every pull request and every change to `main`.
+
+## FAQ
+
+**No cmdlets? Isn't the point of PowerShell to use cmdlets?**
+
+The rule only covers code running inside `Invoke-PkRunspaceJobs` workers. Your main script, every main-thread callback, and the whole external-program side (`Invoke-PkProcessBatch`, `Invoke-PkProcessDispatch`) when called from your main script can use cmdlets freely. Inside workers it's because of a race in PowerShell 5.1: two fresh runspaces running the same cmdlet for the first time at the same moment can deadlock. [Why these rules exist](#why-these-rules-exist) has the details.
+
+**What happens if I use a cmdlet in a worker anyway?**
+
+Most runs work. Some hang at random, with no error. In the original project it was about 1 run in 8 with just two workers, so a test run passing tells you very little. `-CheckWorkerSafety` refuses to start worker code that uses a cmdlet, and `# pk:ignore` on a line accepts it if you've decided the risk is fine.
+
+**Do ThreadJob and PoshRSJob have the same cmdlet problem?**
+
+It hasn't been tested with them. The race is in how PowerShell 5.1 sets up cmdlets in a new runspace, not in this kit, so other runspace-based tools on 5.1 may hit it too, but that's not something that's been reproduced.
+
+**Does it work in PowerShell 7, or on Linux or macOS?**
+
+It's written for and tested on Windows PowerShell 5.1 only. Ctrl+C handling, child-process cleanup and keep-awake all use Windows APIs, so Linux and macOS are out. On PowerShell 7 for Windows it isn't tested, and `ForEach-Object -Parallel` covers most needs there anyway.
+
+**Does it need admin rights?**
+
+No. Nothing it does needs elevation.
+
+**Why a file to dot-source instead of a module?**
+
+As a module it couldn't find the functions you list in `-SharedFunctionNames`, since a module has its own scope. It's also one file you can copy into a project and keep at a known version, with nothing to install on machines where installing modules isn't allowed.
+
+**What happens to running programs when I press Ctrl+C?**
+
+Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. See [Abort](#abort).
+
+**And if the script is killed outright, from Task Manager say?**
+
+The programs it started are killed with it, through a Windows Job Object. There's no waiting period and no cleanup callback in that case, so partial output files can be left behind.
+
+**Can I show progress?**
+
+Yes. `-OnComplete` (batch) and `-PollCallback` (runspace jobs) run on the main thread, so `Write-Progress` or anything else works there. What you can't get is a program's output line by line while it runs: it's handed over when the program exits.
+
+**How many should I run at once?**
+
+Start from the CPU core count and measure. [Choosing limits](#choosing-limits) has more.
+
+**Was this written by AI?**
+
+It was built with Claude Code, as the top of this page says. The worker rules and abort behaviour come from hangs and bugs reproduced in real runs of the original project, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
 
 ## License
 
