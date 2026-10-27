@@ -11,7 +11,7 @@ Run thousands of command-line programs, or blocks of PowerShell code, in paralle
 
 It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Manga-Conversion-Script), but has no dependencies on that project.
 
-Built with Claude.
+Built with Claude Code.
 
 **Contents:** [Who it's for](#who-its-for) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing)
 
