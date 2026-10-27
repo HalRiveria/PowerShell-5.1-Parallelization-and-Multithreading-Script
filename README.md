@@ -1,30 +1,52 @@
 # ParallelKit
 
-Parallel work for Windows PowerShell 5.1, in one file:
+Run thousands of command-line programs, or blocks of PowerShell code, in parallel from Windows PowerShell 5.1, and stop cleanly when you press Ctrl+C. One file, nothing to install.
 
+- **Process dispatch** - run many external programs, a set number at a time, with their output captured.
 - **Runspace jobs** - run a PowerShell worker script many times in parallel.
-- **Process dispatch** - run many external programs, a bounded number at a time.
-- **Graceful abort** - Ctrl+C or closing the window finishes in-flight work and stops cleanly instead of killing the process mid-write.
-- **No orphans** - child processes die with the script, even if it's force-closed.
+- **Graceful abort** - Ctrl+C or closing the window lets in-flight work finish and stops cleanly, instead of killing everything mid-write.
+- **No orphans** - programs the script started die with it, even if it's force-closed.
 
 It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Manga-Conversion-Script), but has no dependencies on that project.
 
 Built with Claude.
 
-Requires Windows and Windows PowerShell 5.1. Nothing to install.
+**Contents:** [Who it's for](#who-its-for) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing)
 
-**Contents:** [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Limits](#limits) · [Testing](#testing)
+## Who it's for
 
-Which one you want: a flat list of external programs → `Invoke-PkProcessBatch`. PowerShell code → `Invoke-PkRunspaceJobs`. Programs that come in groups, with something to do when each group is done → `Invoke-PkProcessDispatch`. Wrap any of them in `Invoke-PkRun` for graceful Ctrl+C.
+Scripts that have to run on Windows PowerShell 5.1, the version built into every Windows 10, Windows 11 and Windows Server install. Usually that's because PowerShell 7 isn't installed or isn't allowed on the machines involved, or because the script has to run anywhere without asking anyone to install anything.
+
+The typical job is batch work over lots of files with a command-line tool: converting images, audio or video, compressing archives, running a check or build step per file. That's what the process side is built for, and it's where most of the kit's care has gone.
+
+If PowerShell 7 is an option, `ForEach-Object -Parallel` covers simple parallel loops. On 5.1, the ThreadJob module is simpler for running plain scriptblocks in parallel. Reach for ParallelKit when you also need any of these:
+
+- Ctrl+C that lets running work finish instead of cutting it off mid-file.
+- Child processes that are cleaned up even if the script is killed outright.
+- A cap on how many external programs run at once, with their output captured without risk of a full-pipe deadlock.
+- Work that comes in groups (a folder at a time, say), with retries or follow-up steps per file and something to do when each group is finished.
+
+Which function you want:
+
+| You have | Use |
+|---|---|
+| A flat list of external programs to run | `Invoke-PkProcessBatch` |
+| Programs that come in groups, with something to do when each group is done | `Invoke-PkProcessDispatch` |
+| PowerShell code to run in parallel | `Invoke-PkRunspaceJobs` |
+| One program to run with a time limit | `Invoke-PkProcessWithTimeout` |
+
+Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C.
 
 ## Setup
 
-Copy `ParallelKit.ps1` into your project and dot-source it:
+Requires Windows and Windows PowerShell 5.1. Copy `ParallelKit.ps1` into your project and dot-source it:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
 $null = Initialize-ParallelKit -MaxConcurrentProcesses 8
 ```
+
+If you downloaded the file, Windows marks it as coming from the internet and your execution policy may refuse to load it. Run `Unblock-File .\ParallelKit.ps1` once to clear that.
 
 It works whether or not your script uses `Set-StrictMode`.
 
@@ -32,9 +54,12 @@ Dot-source it; don't `Import-Module` it. As a module it couldn't see the functio
 
 `Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns `@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part worked (a part that fails also prints a warning).
 
+Each public function has a comment block at the top of its definition in `ParallelKit.ps1` listing its parameters and what it returns. `Get-Help` doesn't show these; read the file.
+
 ## Run a list of programs
 
 ```powershell
+# Any command-line tool works. cjxl is a JPEG XL image encoder.
 $commands = foreach ($f in Get-ChildItem *.png) {
     @{ FilePath = "cjxl.exe"; Arguments = "`"$($f.FullName)`" `"$($f.FullName).jxl`""; Source = $f }
 }
@@ -46,24 +71,36 @@ $batch = Invoke-PkRun {
 }
 ```
 
+Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written, so put quotes around paths that may contain spaces (as above). Programs run hidden, with their output captured.
+
 `Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`, with every field always present:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
+- `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
 - `StartError` is set when the program couldn't be started (not found, say).
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
 
-`-OnComplete` runs only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted.
+`Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
 
-`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without it the engines still work, but Ctrl+C kills the process the normal way. See "Abort" below for what it means for your own code inside the braces.
+`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted.
+
+`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces.
 
 ## Run PowerShell code in parallel
 
 ```powershell
-function Get-FileSha { param($Path) ... }          # raw .NET only - see the rules below
+# Worker code may only use .NET calls, not cmdlets - see "The three rules" below.
+function Get-FileSha {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try { return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 
 $jobs = [System.Collections.Generic.List[hashtable]]::new()
-foreach ($f in $files) { $jobs.Add(@{ Path = $f.FullName }) }
+foreach ($f in Get-ChildItem -File) { $jobs.Add(@{ Path = $f.FullName }) }
 $shaByPath = @{}
 
 $out = Invoke-PkRun {
@@ -78,12 +115,16 @@ $out = Invoke-PkRun {
 }
 ```
 
-- Each job hashtable's keys become the worker's parameters.
+Each worker runs in its own runspace: a separate PowerShell session inside the same process, with its own variables and functions. That separation is what makes running them at the same time safe, and also why a worker can't see your script's variables or functions unless you hand them over.
+
+- Each job hashtable's keys become the worker's parameters. The worker's `param()` block must declare every key. A key it doesn't declare is an error; with a fixed `-JobParams` list it's caught before any worker starts.
+- If the worker declares a `$CancelToken` parameter, it gets the run's cancellation token.
 - `-JobParams` takes a list or array of job hashtables. A single hashtable works too, so a list that happens to hold one job is fine.
 - A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there.
-- Whatever the worker returns is handed to `-ResultHandler` on the main thread.
-- `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily.
-- `-JobCrashedHandler { param($err) ... }` is told when a worker throws.
+- Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
+- `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
+- `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
+- `-JobCrashedHandler { param($err) ... }` is told when a worker throws. That job's result handler isn't called.
 - If one of your main-thread callbacks throws, the run stops: workers still going are told to stop and the exception comes out of the call.
 - Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
 
@@ -92,12 +133,20 @@ $out = Invoke-PkRun {
 Worker code is the worker script, every function in `-SharedFunctionNames`, and anything they call. Breaking these rules doesn't fail loudly. It hangs, or quietly reads nothing.
 
 1. **No `$script:` variables.** In a worker they can silently read as empty. Pass state in as job parameters. (`$script:` at the very top level of the worker script is fine; inside a function or a nested `{ }` block it isn't.)
-2. **No cmdlets.** Two fresh runspaces calling the same cmdlet for the first time at the same moment can deadlock in PowerShell 5.1. Use .NET calls: `[System.IO.File]::Exists($p)` instead of `Test-Path`, `[System.Threading.Thread]::Sleep(100)` instead of `Start-Sleep`, a `foreach` loop instead of `ForEach-Object`, `Write-PkMessage` instead of `Write-Host`.
+2. **No cmdlets.** Two fresh runspaces calling the same cmdlet for the first time at the same moment can deadlock in PowerShell 5.1. Use .NET calls: `[System.IO.File]::Exists($p)` instead of `Test-Path`, `[System.Threading.Thread]::Sleep(100)` instead of `Start-Sleep`, a `foreach` loop instead of `ForEach-Object`, `$null = ...` instead of `| Out-Null`, `[DateTime]::Now` instead of `Get-Date`, `Write-PkMessage` instead of `Write-Host`.
 3. **No scriptblocks handed to .NET as delegates** (`[Func[...]]{ }`, `[Action]{ }`, `System.Lazy`, `ConcurrentDictionary.GetOrAdd($k, { })`). Nested, they deadlock. Use plain loops and `[System.Threading.Monitor]`.
+
+Only worker code is affected. Callbacks that run on the main thread (`-ResultHandler`, `-PollCallback`, `-NextJobProvider`, `-OnComplete`, the message handler) are not worker code and can use anything, cmdlets included.
 
 `Test-PkWorkerSafety -WorkerScript $w -SharedFunctionNames $names` checks all three, plus missing shared functions, and returns a list of findings. For rule 3 it flags both written casts and scriptblocks passed straight into a .NET call. Call it from your tests, or pass `-CheckWorkerSafety` to `Invoke-PkRunspaceJobs` to refuse to launch unsafe code. `# pk:ignore` on a line accepts a finding. It can't see callbacks you pass to a worker as job parameters, or commands run through a variable (`& $cmd`).
 
-Callbacks that run on the main thread (`-ResultHandler`, `-PollCallback`, `-NextJobProvider`, `-OnComplete`, the message handler) are not worker code and can use anything.
+### Why these rules exist
+
+"No cmdlets" in PowerShell code sounds extreme, so here's where each rule comes from. All three were found chasing real, intermittent hangs, and none of them is documented by Microsoft.
+
+- **Cmdlets.** The first time a cmdlet runs in a fresh runspace, PowerShell 5.1 sets it up, and that setup isn't safe when two runspaces do it at the same moment. With just two workers, the original project hung in roughly 1 run in 8. Every cmdlet tried could trigger it, down to `Start-Sleep` and `Out-Null`. Replacing every cmdlet on the worker side with .NET calls took that to 0 hangs in 50 stress runs. The kit's own worker-side functions follow the same rule.
+- **`$script:` variables.** A function listed in `-SharedFunctionNames` is recreated inside the worker from its source text, so it's no longer attached to your script and its `$script:` points somewhere else. Inside a `.GetNewClosure()` block, `$script:` points at a private copy. Either way the read comes back empty, with no error.
+- **Delegates.** When .NET calls a scriptblock through a delegate, PowerShell can hand the call to the runspace's own thread instead of running it on the spot. Nested, the inner call waits for a thread that is itself waiting on that call. It's timing-dependent: it showed up in about 1 or 2 runs in 100, and was only pinned down from process dumps.
 
 ## Process dispatch with groups
 
@@ -112,7 +161,10 @@ Invoke-PkProcessDispatch -MaxConcurrent 6 `
     -GroupCompleteCallback { param($group)  <# e.g. zip the folder #> }
 ```
 
+All of these callbacks run on whichever thread called the dispatcher: the main thread normally, or the worker if you call it from inside a runspace job (in which case the worker rules apply to them).
+
 - **`-GroupCompleteCallback` also runs for a group an abort cut short**, so you can record the jobs in it that did finish. Before doing anything irreversible there (zipping the folder, deleting sources), check `Test-PkCancelRequested` (or your own `-CancelToken`) and skip it if true.
+- `-JobFinalize` is called once per finished job. Collect its exit code and output there with `Complete-PkProcess -Job $job`; the dispatcher disposes the process right after.
 - Groups are pulled lazily, at most `-MaxQueueAhead` (default 3) ahead.
 - A group can be any value: a hashtable, a path, a name. Each job gets its group as `$job.Group`.
 - The dispatcher keeps its state on the job hashtables. Don't use these names for your own job fields: `GroupKey`, `SlotReleased`, `Proc`, `StdoutTask`, `StderrTask`, `Stopwatch`. (`Group` is yours if you set it yourself.)
@@ -121,7 +173,7 @@ Invoke-PkProcessDispatch -MaxConcurrent 6 `
 - Whatever your callbacks output is thrown away, apart from the return values listed here. They can't corrupt the dispatcher's result by accident.
 - `-MaxConcurrent` can be a `SemaphoreSlim` shared by several dispatchers that must stay under one combined limit. It works inside workers, so two runspace jobs can each run a dispatcher against one shared budget.
 - `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released.
-- `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check, for a custom starter whose job isn't a plain process.
+- `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process, or to give each job a time limit (see "Limits").
 - `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running.
 - `-CancelToken` stops the dispatcher when cancelled. An abort stops it either way, without cancelling your token.
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
@@ -150,7 +202,7 @@ Workers can't safely write to the console. `Write-PkMessage "text" -Level Info|W
 Set-PkMessageHandler { param($Message, $Level) Write-MyLog $Message $Level }
 ```
 
-The kit's own notices (abort announcements, crashed workers, force-stops) go through the same handler. If your handler throws, the message is shown on the console instead and the run carries on.
+The handler always runs on the main thread, so it can use anything. The kit's own notices (abort announcements, crashed workers, force-stops) go through the same handler. If your handler throws, the message is shown on the console instead and the run carries on. `Set-PkMessageHandler $null` restores the default.
 
 ## Abort
 
@@ -168,7 +220,15 @@ Two things to know:
 - **Inside `Invoke-PkRun`, Ctrl+C no longer kills anything by itself.** It only raises a flag. The kit's engines watch that flag. A long step of your own in there has to check `Test-PkAbortSignal` now and then and stop when it's true, or Ctrl+C will seem to do nothing until that step ends.
 - **An abort stays in force until it's reset.** `Invoke-PkRun` resets it at the start of each run. If you call an engine again outside `Invoke-PkRun` after an abort, it returns straight away with `Aborted = $true`. Call `Reset-PkAbortState` first if you mean to carry on.
 
+`Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on, one stray click in the console window starts a text selection, and the script freezes for as long as the selection stays there. That looks exactly like a hang. It's turned back on afterwards if it was on before.
+
 Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` or `-CancelToken` you pass to an engine is covered automatically). `Get-PkAbortTriggerLabel` says which kind of abort it was.
+
+## Choosing limits
+
+- **`-MaxConcurrent` for programs.** For programs that use one CPU core each, start at `[Environment]::ProcessorCount`. Many encoders (image, video, compression) already use several cores per file, so fewer copies at once is often as fast and uses less memory. Programs that mostly wait on disk or network can go higher. Try a few values on real work; the best number depends on the tool.
+- **`-MaxParallel` for runspace jobs.** Same idea: the core count for CPU-heavy PowerShell work. Each runspace costs some memory and startup time, so very high values rarely help.
+- **Several dispatchers at once** (for example, one per runspace job) should share one `SemaphoreSlim` as `-MaxConcurrent`, so their combined total stays under the limit you picked.
 
 ## Limits
 
@@ -176,6 +236,9 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
 - One run at a time per process. The abort state is shared. A nested `Invoke-PkRun` just runs inside the outer one.
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.
+- `Invoke-PkProcessBatch` and `Invoke-PkProcessDispatch` have no per-program time limit: a program that hangs holds its slot until it exits or the run is aborted. With the dispatcher you can add one through `-JobPollCompleted`, using the stopwatch the default starter puts on each job: `{ param($job) if ($job['Stopwatch'].Elapsed.TotalMinutes -gt 10) { try { $job['Proc'].Kill() } catch { } }; $job['Proc'].HasExited }`. The killed job then goes through `-JobFinalize` like any other, with a non-zero exit code.
+- Programs run hidden, and there's no way to send them input. A program that stops to ask a question will sit there until it's killed.
+- A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory.
 
 ## Testing
 
