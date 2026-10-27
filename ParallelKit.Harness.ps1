@@ -197,6 +197,11 @@ Test-Assert ($seen.Count -eq 6) "-OnComplete fires for each command that ran"
 Test-Assert (-not $batch.Aborted) "a clean batch is not marked aborted"
 $wd = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = $env:SystemRoot }) -MaxConcurrent 1
 Test-Assert ($wd.Results[0].Stdout.Trim() -ieq $env:SystemRoot) "a command's WorkingDirectory is honored"
+# A foreach over nothing yields $null, not an empty array - the usual way to build the list when no files match.
+$noCommands = foreach ($x in @()) { @{ FilePath = $cmdExe; Arguments = '/c exit 0' } }
+$emptyBatch = $null
+try { $emptyBatch = Invoke-PkProcessBatch -Commands $noCommands -MaxConcurrent 2 } catch { Write-Host "  empty batch threw: $_" }
+Test-Assert ($null -ne $emptyBatch -and $emptyBatch.Results.Count -eq 0 -and -not $emptyBatch.Aborted) "a batch given `$null (an empty foreach) returns no results"
 Write-Host ""
 
 # ==============================================================================
