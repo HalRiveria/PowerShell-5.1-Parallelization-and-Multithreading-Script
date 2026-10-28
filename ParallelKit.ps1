@@ -1970,8 +1970,15 @@ function Test-PkWorkerSafety {
 # block - the batch's own callbacks, or yours - can only see global
 # functions, so it couldn't find them. Defining each one globally too means
 # kit functions work from any closure, however the script was started.
-foreach ($pkFunction in $MyInvocation.MyCommand.ScriptBlock.Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-    $pkLocal = Get-Item -LiteralPath ("Function:\" + $pkFunction.Name)
-    $null = Set-Item -Path ("Function:\global:" + $pkFunction.Name) -Value $pkLocal.ScriptBlock
-}
-Remove-Variable -Name pkFunction, pkLocal -ErrorAction SilentlyContinue
+# Only the kit's own functions (Pk-named, plus Initialize-ParallelKit): the
+# kit may be pasted into a larger script whose other functions are none of
+# its business. Run in a child scope so the loop's variables don't touch
+# the caller's.
+& {
+    param($kitAst)
+    foreach ($fnAst in $kitAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        if ($fnAst.Name -notlike '*-Pk*' -and $fnAst.Name -ne 'Initialize-ParallelKit') { continue }
+        $fn = Get-Item -LiteralPath ("Function:\" + $fnAst.Name) -ErrorAction SilentlyContinue
+        if ($null -ne $fn) { $null = Set-Item -Path ("Function:\global:" + $fnAst.Name) -Value $fn.ScriptBlock }
+    }
+} $MyInvocation.MyCommand.ScriptBlock.Ast
