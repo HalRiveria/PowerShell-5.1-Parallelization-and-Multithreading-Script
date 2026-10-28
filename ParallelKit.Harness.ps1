@@ -232,6 +232,15 @@ if ($compiled) {
     Test-Assert ($byName['default'] -eq $u8Text -and $byName['own'] -ne $u8Text) "batch: -OutputEncoding applies to every command, and a command's own OutputEncoding key overrides it"
     try { [System.IO.File]::Delete($u8Exe) } catch { }  # temp file only; best effort
 }
+Test-Assert ((Resolve-PkEncoding -Encoding '437').CodePage -eq 437) "a code page given as text ('437') is accepted"
+# -OutputEncoding mustn't replace PowerShell's own $OutputEncoding inside the
+# caller's callbacks.
+$seen = @{ Value = 'unset' }
+$null = Invoke-PkProcessBatch -OutputEncoding 'utf-8' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -OnComplete { param($c, $r) $seen.Value = $OutputEncoding }.GetNewClosure()
+Test-Assert ($seen.Value -is [System.Text.Encoding]) ("inside -OnComplete, `$OutputEncoding is still PowerShell's own (got [" + $seen.Value + "])")
+$seen.Value = 'unset'
+$null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -OnComplete { param($c, $r) $seen.Value = $OutputEncoding }
+Test-Assert ($seen.Value -is [System.Text.Encoding]) ("and in an -OnComplete without .GetNewClosure() too (got [" + $seen.Value + "])")
 $threw = $false
 try { $null = Invoke-PkProcessBatch -OutputEncoding 'no-such-encoding' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) } catch { $threw = ($_.ToString() -like "*'no-such-encoding' isn't an encoding*") }
 Test-Assert $threw "an unknown -OutputEncoding fails the call with a clear message"

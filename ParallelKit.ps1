@@ -1274,6 +1274,11 @@ function Invoke-PkProcessBatch {
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $OutputEncoding
+    # $OutputEncoding is also PowerShell's own preference variable. Move the
+    # value to another name before the closures below are built, or they'd
+    # capture it and every -OnComplete would see this instead of PowerShell's.
+    $batchEncoding = $OutputEncoding
+    Remove-Variable -Name OutputEncoding -Scope Local
 
     if ($TimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
@@ -1291,7 +1296,7 @@ function Invoke-PkProcessBatch {
         $jobs = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($c in $Commands) {
             if ($null -eq $c) { continue }
-            $encoding = $OutputEncoding
+            $encoding = $batchEncoding
             if ($c.ContainsKey('OutputEncoding')) { $encoding = $c['OutputEncoding'] }
             $jobs.Add(@{ FilePath = $c['FilePath']; Arguments = [string]$c['Arguments']; WorkingDirectory = [string]$c['WorkingDirectory']; OutputEncoding = $encoding; Command = $c })
         }
