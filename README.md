@@ -136,7 +136,7 @@ Each command is a hashtable with `FilePath`, `Arguments` and optionally `Working
 
 `-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it.
 
-`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces. The block runs inside `Invoke-PkRun`, so a variable of yours named like one of its own (`$ScriptBlock`, `$KeepAwake`, `$DisableQuickEdit`) reads its value instead; add `.GetNewClosure()` to the block if that could happen.
+`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces.
 
 ## Run PowerShell code in parallel
 
@@ -279,6 +279,8 @@ Three things to know:
 - **Your script carries on after an abort.** The engines return with `Aborted = $true` and the rest of your script runs. If an abort should end it, say so: `if ($batch.Aborted) { exit 1 }`.
 
 `Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
+
+The block you give `Invoke-PkRun` runs inside it, so a variable of yours named like one of its own (`$ScriptBlock`, `$KeepAwake`, `$DisableQuickEdit`) reads its value instead of yours. Add `.GetNewClosure()` to the block if that could happen.
 
 Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
 
