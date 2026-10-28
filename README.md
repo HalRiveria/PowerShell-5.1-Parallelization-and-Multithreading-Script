@@ -119,17 +119,20 @@ Long parameter lists in these examples use splatting (`@batchParams`) instead of
 
 Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
 
-`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`, with every field always present:
+`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted; TimedOut }`, with every field always present:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
 - `StartError` is set when the program couldn't be started (not found, say).
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
+- `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
 - `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
 
 `-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted.
+
+`-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it.
 
 `Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces.
 
@@ -239,6 +242,7 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
+| `Stop-PkProcessTree -Process` | Kill a program and every program it started. Returns `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
@@ -287,7 +291,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
 - One run at a time per process. The abort state is shared. A nested `Invoke-PkRun` just runs inside the outer one.
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.
-- `Invoke-PkProcessBatch` and `Invoke-PkProcessDispatch` have no per-program time limit: a program that hangs holds its slot until it exits or the run is aborted. With the dispatcher you can add one through `-JobPollCompleted`, using the stopwatch the default starter puts on each job: `{ param($job) if ($job['Stopwatch'].Elapsed.TotalMinutes -gt 10) { try { $job['Proc'].Kill() } catch { } }; $job['Proc'].HasExited }`. The killed job then goes through `-JobFinalize` like any other, with a non-zero exit code.
+- `Invoke-PkProcessDispatch` has no per-program time limit (`Invoke-PkProcessBatch` has `-TimeoutSeconds`): a program that hangs holds its slot until it exits or the run is aborted. You can add one through `-JobPollCompleted`, using the stopwatch the default starter puts on each job: `{ param($job) if ($job['Stopwatch'].Elapsed.TotalMinutes -gt 10) { $null = Stop-PkProcessTree -Process $job['Proc'] }; $job['Proc'].HasExited }`. The killed job then goes through `-JobFinalize` like any other, with a non-zero exit code.
 - Programs run hidden, and there's no way to send them input. A program that stops to ask a question will sit there until it's killed.
 - A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory.
 
