@@ -1714,18 +1714,36 @@ function Test-PkWorkerSafety {
         # [System.Lazy[object]]::new({ ... }). No cast is written, but .NET
         # receives a delegate all the same. .ForEach()/.Where() are
         # PowerShell's own and take real scriptblocks, so they're fine.
+        # The same goes for a variable assigned a scriptblock literal (or
+        # { }.GetNewClosure()) anywhere in this code, then passed as
+        # $lazy = [System.Lazy[object]]::new($factory). By name, not by flow:
+        # a variable reassigned to something else in between is still flagged.
+        $scriptBlockVars = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($assign in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+            $target = $assign.Left
+            if ($target -is [System.Management.Automation.Language.ConvertExpressionAst]) { $target = $target.Child }
+            if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $rhs = $assign.Right
+            if ($rhs -is [System.Management.Automation.Language.PipelineAst] -and $rhs.PipelineElements.Count -eq 1) { $rhs = $rhs.PipelineElements[0] }
+            if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) { $rhs = $rhs.Expression }
+            if ($rhs -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$rhs.Member.Extent.Text -eq 'GetNewClosure') { $rhs = $rhs.Expression }
+            if ($rhs -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $null = $scriptBlockVars.Add($target.VariablePath.UserPath) }
+        }
         foreach ($call in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
             if ($null -eq $call.Arguments) { continue }
             $memberName = [string]$call.Member.Extent.Text
             if ($memberName -in @('ForEach', 'Where')) { continue }
-            $passesScriptBlock = $false
+            $passed = $null
             foreach ($argument in $call.Arguments) {
-                if ($argument -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $passesScriptBlock = $true }
+                if ($argument -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $passed = 'a scriptblock' }
+                elseif ($argument -is [System.Management.Automation.Language.VariableExpressionAst] -and $scriptBlockVars.Contains($argument.VariablePath.UserPath)) {
+                    $passed = ("the scriptblock in `$" + $argument.VariablePath.UserPath)
+                }
             }
-            if (-not $passesScriptBlock) { continue }
+            if ($null -eq $passed) { continue }
             if ($call.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
             $findings.Add(@{ Rule = 'DelegateCast'; Where = $t.Where; Line = $call.Extent.StartLineNumber
-                             Text = ($t.Where + " (line " + $call.Extent.StartLineNumber + ") passes a scriptblock to ." + $memberName + "() - .NET turns it into a delegate, which can hang or crash a worker (add '# pk:ignore' if this method really takes a scriptblock)") })
+                             Text = ($t.Where + " (line " + $call.Extent.StartLineNumber + ") passes " + $passed + " to ." + $memberName + "() - .NET turns it into a delegate, which can hang or crash a worker (add '# pk:ignore' if this method really takes a scriptblock)") })
         }
     }
 

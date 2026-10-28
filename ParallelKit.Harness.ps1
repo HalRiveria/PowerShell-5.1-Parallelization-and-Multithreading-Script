@@ -658,6 +658,12 @@ $f = Test-PkWorkerSafety -WorkerScript { param($Id) $lazy = [System.Lazy[object]
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a scriptblock passed to a .NET constructor is flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $x = @(1, 2).ForEach({ $_ }); $y = @(1, 2).Where({ $_ }); $z = { 1 }.GetNewClosure() }
 Test-Assert ($f.Count -eq 0) "PowerShell's own .ForEach()/.Where()/.GetNewClosure() are not flagged"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $factory = { 1 }; $lazy = [System.Lazy[object]]::new($factory) }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast' -and $f[0].Text -like '*$factory*') "a variable holding a scriptblock, passed to a .NET constructor, is flagged by name"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $add = { param($k, $old) $old + 1 }.GetNewClosure(); $d = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new(); $null = $d.AddOrUpdate('a', 1, $add) }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a variable holding a .GetNewClosure() block, passed to a .NET method, is flagged"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $sb = { $_ * 2 }; $n = 'x'; $x = @(1, 2).ForEach($sb); $null = $n.Contains($n) }
+Test-Assert ($f.Count -eq 0) "a scriptblock variable given to .ForEach(), and other variables given to .NET methods, are not flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $list = [System.Collections.Generic.List[scriptblock]]::new(); $list.Add({ 1 })  # pk:ignore
 }
 Test-Assert ($f.Count -eq 0) "'# pk:ignore' accepts a method that really does take a scriptblock"
