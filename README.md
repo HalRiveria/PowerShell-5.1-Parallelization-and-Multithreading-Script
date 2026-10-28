@@ -99,7 +99,7 @@ The kit's functions are also defined globally, so they stay available for the re
 
 `Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
-Each public function has a comment block at the top of its definition in `ParallelKit.ps1` listing its parameters and what it returns. `Get-Help` doesn't show these; read the file.
+Each public function has built-in help: `Get-Help Invoke-PkProcessBatch -Full` shows its parameters, their defaults, what it returns and an example.
 
 ## Run a list of programs
 
@@ -249,7 +249,7 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
-| `Stop-PkProcessTree -Process` | Kill a program and every program it started. Returns `$false` if it had already exited. |
+| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started, in one `taskkill` call. For one program, returns `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 

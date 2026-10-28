@@ -294,8 +294,16 @@ if (-not (Test-Path -LiteralPath 'Variable:\global:PkCancelToken')) { $global:Pk
 # ==============================================================================
 
 function Set-PkMessageHandler {
-    # $Handler receives ($Message, $Level); Level is Info, Warn or Error.
-    # It always runs on the main thread. Pass $null to restore the default.
+    # .SYNOPSIS
+    # Sends every message the kit writes to your own scriptblock.
+    # .DESCRIPTION
+    # The handler gets ($Message, $Level), where Level is Info, Warn or Error, and
+    # always runs on the main thread, including for messages from worker code. If it
+    # throws, the message is shown on the console instead and the run carries on.
+    # .PARAMETER Handler
+    # { param($Message, $Level) ... }, or $null to go back to the default (console).
+    # .EXAMPLE
+    # Set-PkMessageHandler { param($Message, $Level) Add-Content run.log "$Level $Message" }
     param([scriptblock]$Handler)
     [PkState]::MessageHandler = $Handler
 }
@@ -320,9 +328,15 @@ function Invoke-PkMessageHandler {
 }
 
 function Write-PkMessage {
-    # Safe to call from anywhere. In a worker runspace the message is queued
-    # and the main thread delivers it; on the main thread it goes straight to
-    # the message handler.
+    # .SYNOPSIS
+    # Writes a message through the kit's message handler. Safe to call from worker code.
+    # .DESCRIPTION
+    # In a worker runspace the message is queued and the main thread delivers it; on
+    # the main thread it goes straight to the handler (see Set-PkMessageHandler).
+    # .PARAMETER Message
+    # The text.
+    # .PARAMETER Level
+    # Info (the default), Warn or Error.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyString()]
@@ -380,7 +394,17 @@ function Initialize-PkThreadPool {
 }
 
 function Initialize-ParallelKit {
-    # One-call setup. Safe to call more than once.
+    # .SYNOPSIS
+    # Sets up Ctrl+C handling, child-process cleanup and the thread pool up front. Optional.
+    # .DESCRIPTION
+    # The engines set up what they need on first use anyway. Safe to call more than
+    # once. A failed Ctrl+C handler or child-process cleanup also prints a warning.
+    # .PARAMETER MaxConcurrentProcesses
+    # How many programs you expect to run at once, used to size the thread pool.
+    # 0 (the default) sizes it for up to about 48.
+    # .OUTPUTS
+    # An object with AbortHandler, ChildProcessJob and ThreadPool, each $true if that
+    # part worked.
     param([int]$MaxConcurrentProcesses = 0)
     $handlerOk = Register-PkAbortHandler
     $jobOk     = Initialize-PkChildProcessJob
@@ -399,11 +423,19 @@ function Set-PkConsoleQuickEdit {
 }
 
 function Register-PkCancellationSource {
-    # Every registered source is cancelled the moment an abort is detected.
-    # An abort stays in force until Reset-PkAbortState (Invoke-PkRun does
-    # that at the start of each run), so a source registered while one is
-    # still in force is cancelled on the spot - otherwise a later run would
-    # start normally while its workers, seeing the old flag, quietly did nothing.
+    # .SYNOPSIS
+    # Adds your own CancellationTokenSource to the set an abort cancels.
+    # .DESCRIPTION
+    # Every registered source is cancelled the moment an abort is detected. If an
+    # abort is still in force when you register (see Reset-PkAbortState), the source
+    # is cancelled straight away. A -Cts passed to Invoke-PkRunspaceJobs is
+    # registered for you. Remove it with Unregister-PkCancellationSource when done.
+    # .PARAMETER Cts
+    # The source to cancel on an abort.
+
+    # Cancelling a source registered while an old abort is still in force
+    # matters: otherwise a later run would start normally while its workers,
+    # seeing the old flag, quietly did nothing.
     param([Parameter(Mandatory)][System.Threading.CancellationTokenSource]$Cts)
     [PkState]::AddSource($Cts)
     if ([PkState]::AbortLatched) {
@@ -412,14 +444,25 @@ function Register-PkCancellationSource {
 }
 
 function Unregister-PkCancellationSource {
+    # .SYNOPSIS
+    # Removes a source added with Register-PkCancellationSource.
+    # .PARAMETER Cts
+    # The source to remove.
     param([Parameter(Mandatory)][System.Threading.CancellationTokenSource]$Cts)
     $null = [PkState]::RemoveSource($Cts)
 }
 
 function Reset-PkAbortState {
-    # Clears a finished abort so work can carry on. Deliberately leaves
-    # RunActive alone: that belongs to Invoke-PkRun, and clearing it here
-    # would disarm a run that calls this part-way through.
+    # .SYNOPSIS
+    # Clears a finished abort so the engines run again.
+    # .DESCRIPTION
+    # An abort stays in force until this is called: until then every engine returns
+    # straight away with Aborted = $true. Invoke-PkRun calls it at the start of each
+    # run, so you only need it to call an engine again outside Invoke-PkRun after an
+    # abort.
+
+    # Deliberately leaves RunActive alone: that belongs to Invoke-PkRun, and
+    # clearing it here would disarm a run that calls this part-way through.
     [PkState]::AbortLatched = $false
     [PkState]::CloseAbort   = $false
     [PkConsoleCtrl]::AbortRequested = $false
@@ -428,13 +471,21 @@ function Reset-PkAbortState {
 }
 
 function Request-PkAbort {
-    # Programmatic abort - same effect as the user pressing Ctrl+C mid-run.
+    # .SYNOPSIS
+    # Starts an abort from code, the same as the user pressing Ctrl+C.
     [PkConsoleCtrl]::AbortRequested = $true
 }
 
 function Test-PkAbortSignal {
-    # In a worker: just reports the flag. On the main thread: the first call
-    # after an abort also cancels every registered source and announces it.
+    # .SYNOPSIS
+    # Returns $true once an abort (Ctrl+C, window close, Request-PkAbort) is under way.
+    # .DESCRIPTION
+    # Inside Invoke-PkRun, Ctrl+C only raises a flag. A long step of your own there
+    # should check this now and then and stop when it's true. On the main thread, the
+    # first call after an abort also cancels every registered source and announces
+    # the abort. Worker code should use Test-PkCancelRequested instead.
+    # .OUTPUTS
+    # [bool]
     if ($null -ne $global:PkWorkerQueue) {
         return [PkConsoleCtrl]::AbortRequested
     }
@@ -457,12 +508,23 @@ function Test-PkAbortSignal {
 }
 
 function Test-PkCancelRequested {
-    # For worker code: true once this run is being cancelled or aborted.
+    # .SYNOPSIS
+    # For worker code: returns $true once this run is being cancelled or aborted.
+    # .DESCRIPTION
+    # Check it before any step that can't be undone (deleting a source file, say)
+    # and skip the step if it's true: a worker that was force-stopped isn't killed,
+    # and can carry on once its current .NET call returns.
+    # .OUTPUTS
+    # [bool]
     if ($null -ne $global:PkCancelToken -and $global:PkCancelToken.IsCancellationRequested) { return $true }
     return [PkConsoleCtrl]::AbortRequested
 }
 
 function Get-PkAbortTriggerLabel {
+    # .SYNOPSIS
+    # Says what started the abort: "Ctrl+C" or "window close (X button)".
+    # .OUTPUTS
+    # [string]
     if ([PkState]::CloseAbort) { return "window close (X button)" }
     return "Ctrl+C"
 }
@@ -481,13 +543,32 @@ function Test-PkOwnAbortException {
 }
 
 function Invoke-PkRun {
-    # Brackets a run: inside $ScriptBlock, Ctrl+C / closing the window asks
-    # the engines to stop cleanly instead of killing the process.
+    # .SYNOPSIS
+    # Runs a block with graceful Ctrl+C: the kit's engines wind their work down
+    # instead of the script being killed.
+    # .DESCRIPTION
+    # Inside the block, Ctrl+C no longer kills anything by itself. It raises a flag
+    # the kit's engines watch: no new work starts, running work gets time to finish,
+    # and whatever is left is then stopped. A long step of your own in here must
+    # check Test-PkAbortSignal now and then and stop when it's true, or Ctrl+C will
+    # seem to do nothing until that step ends. Closing the window skips the wait.
     #
-    # Inside the bracket Ctrl+C no longer kills anything by itself - it only
-    # raises a flag. The kit's engines watch it. A long step of YOUR OWN in
-    # here must check Test-PkAbortSignal now and then and stop when it turns
-    # true, or Ctrl+C will appear to do nothing until that step ends.
+    # For the length of the run it also keeps the PC from idle-sleeping and turns off
+    # the console's QuickEdit mode. Whatever the block outputs is passed through.
+    #
+    # The block runs inside this function, so a variable of yours named $ScriptBlock,
+    # $KeepAwake or $DisableQuickEdit reads this function's value instead.
+    # Add .GetNewClosure() to the block if that could happen.
+    # .PARAMETER ScriptBlock
+    # The work to run.
+    # .PARAMETER DisableQuickEdit
+    # Turn QuickEdit off during the run (default $true). With it on, one stray click
+    # starts a selection and freezes the script at its next console write.
+    # .PARAMETER KeepAwake
+    # Stop the PC idle-sleeping during the run (default $true). The display can
+    # still turn off.
+    # .EXAMPLE
+    # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
     param(
         [Parameter(Mandatory)]
         [scriptblock]$ScriptBlock,
@@ -527,13 +608,24 @@ function Invoke-PkRun {
 # ==============================================================================
 
 function ConvertTo-PkArgumentString {
-    # Joins arguments into one command line, quoting each so a program sees
-    # exactly that list: an argument with a space, tab, newline or quote is
-    # wrapped in quotes, its quotes become \", and backslashes are doubled
-    # where they come before a quote. These are the C runtime's rules, which
-    # most Windows programs use (cmd.exe's own parsing is different).
+    # .SYNOPSIS
+    # Joins a list of arguments into one command line, quoted so the program gets
+    # exactly that list back.
+    # .DESCRIPTION
+    # An argument with a space, tab, newline or quote is wrapped in quotes, its
+    # quotes become \", and backslashes are doubled where they come before a quote.
+    # These are the C runtime's rules, which most Windows programs use; cmd.exe /c
+    # parses its own way.
+    # .PARAMETER Arguments
+    # The arguments, in order.
+    # .OUTPUTS
+    # [string]
+    # .EXAMPLE
+    # ConvertTo-PkArgumentString @('C:\My Files\a.png', '-o', 'C:\out\a.jxl')
+    #
+    # Returns: "C:\My Files\a.png" -o C:\out\a.jxl
+
     # .NET Framework's ProcessStartInfo has no ArgumentList, hence this.
-    #   ConvertTo-PkArgumentString @($in, '-o', $out)  ->  "C:\My Files\a.png" -o C:\out\a.jxl
     param(
         [Parameter(Mandatory, Position = 0)]
         [AllowEmptyCollection()]
@@ -588,11 +680,25 @@ function Resolve-PkEncoding {
 }
 
 function Start-PkProcess {
-    # Starts a hidden child process with stdout/stderr redirected and being
-    # read asynchronously (so a chatty process can't block on a full pipe).
-    # $OutputEncoding is how the program's output is decoded ('utf-8', a
-    # code page number, or an Encoding); unset, it's the console's code page.
-    # Returns @{ Proc; StdoutTask; StderrTask; Stopwatch }.
+    # .SYNOPSIS
+    # Starts one program hidden, with its output captured in the background.
+    # .DESCRIPTION
+    # The output is read as it arrives, so a chatty program can't stall on a full
+    # pipe. The program is tied to the script and dies if the script is killed.
+    # Pass what this returns to Wait-PkProcess and Complete-PkProcess. Throws if the
+    # program can't be started.
+    # .PARAMETER FilePath
+    # The program to run.
+    # .PARAMETER Arguments
+    # Its command line as one string (see ConvertTo-PkArgumentString).
+    # .PARAMETER WorkingDirectory
+    # Where to run it. Default: the PowerShell process's working directory, which
+    # isn't always your current location.
+    # .PARAMETER OutputEncoding
+    # How to decode its output: a name like 'utf-8', a code page number, or a
+    # [System.Text.Encoding]. Default: the console's code page.
+    # .OUTPUTS
+    # A hashtable @{ Proc; StdoutTask; StderrTask; Stopwatch }.
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
@@ -638,11 +744,17 @@ function Start-PkProcess {
 }
 
 function Stop-PkProcessTree {
-    # Kills processes and every process they started (taskkill /T /F, one
-    # call for all of them), so none is left holding output open. Falls back
-    # to killing a process directly. With one process, returns $true if this
-    # call killed it, $false if it had already exited on its own; with
-    # several, $true if this call killed any of them.
+    # .SYNOPSIS
+    # Kills one or more programs and every program they started.
+    # .DESCRIPTION
+    # Uses one taskkill /T call for all of them, so none is left running and
+    # holding a program's output open; falls back to killing each program
+    # directly.
+    # .PARAMETER Process
+    # The program(s), such as the Proc that Start-PkProcess returns.
+    # .OUTPUTS
+    # [bool] For one program, $true if this call killed it and $false if it
+    # had already exited. For several, $true if this call killed any of them.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -689,9 +801,17 @@ function Stop-PkJobProcesses {
 }
 
 function Wait-PkProcess {
-    # Waits on the raw process handle. Returns $true if it exited in time.
-    # (Process.WaitForExit(int) also waits on the redirected streams and can
-    # hang past its own timeout - this can't.)
+    # .SYNOPSIS
+    # Waits for a program to exit, with a timeout that can't overrun.
+    # .DESCRIPTION
+    # Waits on the process handle itself. Process.WaitForExit(int) also waits for
+    # redirected output and can hang well past its own timeout.
+    # .PARAMETER Process
+    # The program, such as the Proc that Start-PkProcess returns.
+    # .PARAMETER TimeoutMs
+    # How long to wait, in milliseconds.
+    # .OUTPUTS
+    # [bool] $true if it exited in time.
     param(
         [Parameter(Mandatory)]
         [System.Diagnostics.Process]$Process,
@@ -710,10 +830,20 @@ function Wait-PkProcess {
 }
 
 function Complete-PkProcess {
-    # Call once the process has exited. Returns an object with
-    # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError. A process that exited
-    # can still have an open pipe (a grandchild inherited it), so the stream
-    # read is bounded too.
+    # .SYNOPSIS
+    # Collects the exit code and output of a program that has exited.
+    # .DESCRIPTION
+    # A program that exited can still have its output held open by a program it
+    # started, so reading the output is time-limited too; StreamTimedOut says when
+    # that limit was hit.
+    # .PARAMETER Job
+    # What Start-PkProcess returned, or a dispatcher job with the same keys.
+    # .PARAMETER StreamTimeoutMs
+    # How long to wait for the output after the program exits (default 15000).
+    # .PARAMETER Dispose
+    # Dispose the process object afterwards (default $false).
+    # .OUTPUTS
+    # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
     param(
         [Parameter(Mandatory)]
         [hashtable]$Job,
@@ -743,10 +873,31 @@ function Complete-PkProcess {
 }
 
 function Invoke-PkProcessWithTimeout {
-    # Run one process to completion, synchronously, with a hard time limit.
-    # Returns Complete-PkProcess's object (ExitCode, Stdout, Stderr, StreamTimedOut, StreamError);
-    # throws if the process had to be killed - because it overran, or
-    # because the run was aborted/cancelled while it was going.
+    # .SYNOPSIS
+    # Runs one program to completion, with a hard time limit.
+    # .DESCRIPTION
+    # Throws if the program had to be killed: because it ran past -TimeoutMs, or
+    # because the run was aborted or cancelled while it was going. Anything the
+    # program started is killed with it.
+    # .PARAMETER FilePath
+    # The program to run.
+    # .PARAMETER Arguments
+    # Its command line as one string (see ConvertTo-PkArgumentString).
+    # .PARAMETER TimeoutMs
+    # The time limit in milliseconds (default 60000).
+    # .PARAMETER StreamTimeoutMs
+    # How long to wait for the output after the program exits (default 15000).
+    # .PARAMETER WorkingDirectory
+    # Where to run it, as for Start-PkProcess.
+    # .PARAMETER OutputEncoding
+    # How to decode its output, as for Start-PkProcess.
+    # .PARAMETER IgnoreAbort
+    # Keep going during an abort, for a cleanup or restore step that has to run
+    # because of it.
+    # .OUTPUTS
+    # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
+    # .EXAMPLE
+    # $r = Invoke-PkProcessWithTimeout -FilePath git.exe -Arguments 'rev-parse HEAD' -TimeoutMs 10000
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
@@ -791,33 +942,61 @@ function Invoke-PkProcessWithTimeout {
 # ==============================================================================
 
 function Invoke-PkProcessDispatch {
-    # Work arrives as GROUPS (a folder, a batch, anything). For each group
-    # $JobBuilder returns its jobs; jobs run up to $MaxConcurrent at once;
-    # $GroupCompleteCallback fires when a group's last job finishes.
+    # .SYNOPSIS
+    # Runs external programs grouped by unit of work (a folder, a batch), a limited
+    # number at a time, with a callback when each group is done.
+    # .DESCRIPTION
+    # Groups are pulled one at a time from -GroupProvider; -JobBuilder turns each
+    # into job hashtables; jobs run up to -MaxConcurrent at once across all groups;
+    # -GroupCompleteCallback fires when a group's last job finishes. Anything your
+    # callbacks output is discarded.
     #
-    #   GroupProvider          { }                  -> next group object, or $null when done
-    #   JobBuilder             { param($group) }    -> hashtable job(s), or @() for none
-    #   JobStarter             { param($job) }      -> the job, with .Proc set (default: Start-PkProcess
-    #                                                  on $job['FilePath'] / $job['Arguments'] / $job['WorkingDirectory'])
-    #   JobPollCompleted       { param($job) }      -> $true once finished (default: $job['Proc'].HasExited)
-    #   JobFinalize            { param($job, $pendingQueue) } -> collect the result. To retry or add
-    #                                                  follow-up work, enqueue new job hashtable(s) onto
-    #                                                  $pendingQueue; they join the same group
-    #   JobAbortCleanup        { param($job) }      -> remove partial output of a killed/never-started job
-    #   GroupCompleteCallback  { param($group) }
-    #   GroupReleaseCheck      { param($group) }    -> $true to release a ZERO-job group's queue-ahead slot
-    #
-    # The dispatcher keeps its own state ON each job hashtable. These names
-    # are its own - don't use them for anything else in your jobs:
-    #   GroupKey, SlotReleased          internal bookkeeping
-    #   Proc, StdoutTask, StderrTask, Stopwatch   the running process (set by the starter)
-    # It also sets .Group to the job's group object, unless your job already
-    # has a Group field of its own.
-    # $MaxConcurrent is an int, or a SemaphoreSlim shared between several
+    # The dispatcher keeps its own state on each job hashtable. Don't use these keys
+    # for anything else: GroupKey, SlotReleased, Proc, StdoutTask, StderrTask,
+    # Stopwatch. It also sets Group to the job's group, unless the job already has a
+    # Group of its own. The default starter reads FilePath, Arguments,
+    # WorkingDirectory and OutputEncoding from the job.
+    # .PARAMETER GroupProvider
+    # { } returning the next group, or $null when there are no more.
+    # .PARAMETER JobBuilder
+    # { param($group) } returning the group's job hashtable(s), or @() for none.
+    # .PARAMETER JobStarter
+    # { param($job) } that starts the job and returns it with .Proc set. Default:
+    # Start-PkProcess on the job's FilePath and Arguments.
+    # .PARAMETER JobPollCompleted
+    # { param($job) } returning $true once the job is finished. Default:
+    # $job['Proc'].HasExited. Also the place for a per-job time limit.
+    # .PARAMETER JobFinalize
+    # { param($job, $pendingQueue) } called once per finished job; collect its
+    # result with Complete-PkProcess. Enqueue new job hashtables onto $pendingQueue
+    # to retry or add follow-up work in the same group.
+    # .PARAMETER JobAbortCleanup
+    # { param($job) } for a job an abort killed or kept from starting, to remove its
+    # partial output.
+    # .PARAMETER GroupCompleteCallback
+    # { param($group) } when a group's last job finishes. Also called for a group an
+    # abort cut short, so check Test-PkCancelRequested before anything irreversible.
+    # .PARAMETER MaxConcurrent
+    # How many programs run at once: an int, or a SemaphoreSlim shared by several
     # dispatchers that must stay under one combined limit.
-    # Returns an object with GroupResults, Aborted, ForceKilledCount, JobStarterFailedCount;
-    # each group result has GroupInfo, Completed, Aborted.
-    # Anything your callbacks output is discarded, except where a return value is listed above.
+    # .PARAMETER AbortPollCallback
+    # { param($runningJobs) } run on every loop pass, with the jobs currently running.
+    # .PARAMETER CancelToken
+    # Stops the dispatcher when cancelled. An abort stops it either way, without
+    # cancelling this token.
+    # .PARAMETER AbortTimeoutSeconds
+    # How long an abort waits for running jobs before force-stopping them
+    # (default 60). A force-stopped program is killed along with anything it
+    # started.
+    # .PARAMETER MaxQueueAhead
+    # How many groups to pull ahead of the ones running (default 3).
+    # .PARAMETER GroupReleaseCheck
+    # { param($group) } returning $true to release a zero-job group's queue-ahead
+    # slot; until then it holds the slot.
+    # .OUTPUTS
+    # An object with GroupResults, Aborted, ForceKilledCount and
+    # JobStarterFailedCount. Each group result has GroupInfo (the group), Completed
+    # and Aborted.
     param(
         [Parameter(Mandatory)]
         [scriptblock]$GroupProvider,
@@ -1296,19 +1475,38 @@ function New-PkBatchResult {
 }
 
 function Invoke-PkProcessBatch {
-    # The simple case: run a flat list of commands, $MaxConcurrent at a time.
-    # Each command is @{ FilePath = ...; Arguments = ...; WorkingDirectory = ... (optional);
-    # OutputEncoding = ... (optional, overrides -OutputEncoding); <anything else> }.
-    # $OnComplete { param($command, $result) } fires as each one finishes
-    # (not for one that couldn't start or was stopped by an abort).
-    # $TimeoutSeconds > 0 kills a program still running after that long; its
-    # result has TimedOut = $true (0 = no limit).
-    # Returns an object with Results, Aborted, ForceKilledCount; each result
-    # is an object with Command, ExitCode, Stdout, Stderr, StreamTimedOut,
-    # StreamError, StartError, Aborted, TimedOut - every field always present,
-    # since all three places that build one go through New-PkBatchResult.
-    # $Commands may be $null: a foreach that matches nothing yields $null, not
-    # an empty array, and an empty batch should just return no results.
+    # .SYNOPSIS
+    # Runs a list of external programs, a limited number at a time, and returns
+    # each one's exit code and output.
+    # .DESCRIPTION
+    # Each command is a hashtable: @{ FilePath = ...; Arguments = ... } plus,
+    # optionally, WorkingDirectory, OutputEncoding (overrides -OutputEncoding) and
+    # any keys of your own, which come back on the result's Command. Inside
+    # Invoke-PkRun, Ctrl+C lets running programs finish (up to -AbortTimeoutSeconds)
+    # and starts no new ones.
+    # .PARAMETER Commands
+    # The command hashtables. $null or empty returns no results.
+    # .PARAMETER MaxConcurrent
+    # How many programs run at once (default 4).
+    # .PARAMETER OnComplete
+    # { param($command, $result) } run on the main thread as each program finishes.
+    # Not called for one that couldn't start or was stopped by an abort.
+    # .PARAMETER AbortTimeoutSeconds
+    # How long an abort waits for running programs before killing them (default 60).
+    # .PARAMETER TimeoutSeconds
+    # Kill a program still running after this long (default 0, no limit). Its
+    # result has TimedOut = $true.
+    # .PARAMETER OutputEncoding
+    # How to decode every program's output: a name like 'utf-8', a code page number,
+    # or a [System.Text.Encoding]. Default: the console's code page.
+    # .OUTPUTS
+    # An object with Results, Aborted and ForceKilledCount. Each result has Command,
+    # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted and
+    # TimedOut, in the order the programs finished.
+    # .EXAMPLE
+    # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")) } }
+    # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
+    # $batch.Results | Format-Table ExitCode, Aborted, TimedOut
     param(
         [Parameter(Mandatory)]
         [AllowNull()]
@@ -1502,22 +1700,49 @@ function Invoke-PkGracefulDrain {
 }
 
 function Invoke-PkRunspaceJobs {
-    # Runs $WorkerScript once per job, up to $MaxParallel at a time, each in
+    # .SYNOPSIS
+    # Runs a PowerShell scriptblock once per job, a limited number at a time, each in
     # its own runspace.
-    #
-    #   WorkerScript         a scriptblock with a param() block. Each job's
-    #                        hashtable keys are passed as its parameters. If
-    #                        it declares $CancelToken, it gets the run's token.
-    #   JobParams            a fixed list/array of job hashtables (or just one), OR
-    #   NextJobProvider      { } -> next job hashtable, or $null when done
-    #                        (runs on the main thread, so it can be lazy)
-    #   SharedFunctionNames  YOUR functions the worker calls - a runspace
-    #                        starts empty apart from the kit's own
-    #   ResultHandler        { param($result) }  main thread, once per object a worker returns
-    #   PollCallback         { }                 main thread, every loop pass
-    #   JobCrashedHandler    { param($errorRecord) }  main thread, when a worker throws
-    #
-    # Returns an object with ForceStoppedCount, CrashedCount, Aborted.
+    # .DESCRIPTION
+    # Each job hashtable's keys become the worker's parameters. A worker runspace
+    # starts empty apart from cmdlets, installed modules and the kit's own worker
+    # functions, so name every function of yours it calls in -SharedFunctionNames.
+    # The worker code is checked against the worker rules (see the README)
+    # before anything starts, and each job's values before that job starts;
+    # code or values that break them are refused.
+    # .PARAMETER WorkerScript
+    # A scriptblock with a param() block declaring every job key. If it declares
+    # $CancelToken, it gets the run's cancellation token.
+    # .PARAMETER JobParams
+    # A list or array of job hashtables, or a single one. Use this or
+    # -NextJobProvider.
+    # .PARAMETER NextJobProvider
+    # { } returning the next job hashtable, or $null when there are no more. Runs on
+    # the main thread, so jobs can be produced lazily.
+    # .PARAMETER SharedFunctionNames
+    # Your functions the worker calls.
+    # .PARAMETER MaxParallel
+    # How many workers run at once.
+    # .PARAMETER Cts
+    # Your own CancellationTokenSource for the run; an abort cancels it too.
+    # .PARAMETER ResultHandler
+    # { param($result) } on the main thread, once per object a worker returns.
+    # .PARAMETER PollCallback
+    # { } on the main thread, every loop pass (for progress and the like).
+    # .PARAMETER JobCrashedHandler
+    # { param($errorRecord) } on the main thread when a worker throws.
+    # .PARAMETER DrainTimeoutSeconds
+    # How long an abort waits for running workers before force-stopping them
+    # (default 60).
+    # .PARAMETER AbortWaitMessage
+    # The message shown while an abort waits; '' for none.
+    # .PARAMETER CheckWorkerSafety
+    # Check the worker code and job values before starting (default on).
+    # -CheckWorkerSafety:$false turns it off.
+    # .OUTPUTS
+    # An object with ForceStoppedCount, CrashedCount and Aborted.
+    # .EXAMPLE
+    # Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) $Id * 2 } -ResultHandler { param($r) Write-Host $r }
     param(
         [Parameter(Mandatory)]
         [scriptblock]$WorkerScript,
@@ -1854,16 +2079,26 @@ function Get-PkScriptBlockJobMessage {
 }
 
 function Test-PkWorkerSafety {
-    # Static check of a worker script and the functions shared with it.
-    # Returns a list of findings (empty = clean); each is
-    # an object with Rule, Where, Line, Text. Put "# pk:ignore" on a line to accept it.
-    #
-    #   MissingFunction  the worker calls one of your functions that isn't in -SharedFunctionNames
-    #   ScriptVariable   a shared function (or a nested scriptblock or function in the worker) uses $script:
-    #   DelegateCast     worker-reachable code casts a scriptblock to a .NET delegate, or passes
-    #                    one straight into a .NET method/constructor (which converts it to one)
-    #
-    # Not visible from here: commands invoked through a variable (& $cmd).
+    # .SYNOPSIS
+    # Checks worker code against the worker rules without running it.
+    # .DESCRIPTION
+    # Invoke-PkRunspaceJobs runs this check itself; call it directly from your own
+    # tests. Each finding has a Rule:
+    #   MissingFunction  the worker calls a function of yours that isn't shared
+    #   ScriptVariable   a shared function, or a nested block or function in the
+    #                    worker, uses $script:
+    #   DelegateCast     a scriptblock is cast to a .NET delegate, or passed into
+    #                    a .NET method or constructor that turns it into one
+    # Put "# pk:ignore" on a line to accept a finding there. Commands run through a
+    # variable (& $cmd) aren't seen.
+    # .PARAMETER WorkerScript
+    # The worker scriptblock.
+    # .PARAMETER SharedFunctionNames
+    # The functions you'd pass to -SharedFunctionNames.
+    # .OUTPUTS
+    # A list of findings (empty when clean), each an object with Rule, Where, Line
+    # and Text.
+
     # Scriptblocks handed to a worker as job values are refused separately,
     # by Invoke-PkRunspaceJobs (see Get-PkScriptBlockJobKey).
     param(
