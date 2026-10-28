@@ -795,6 +795,36 @@ $probeThreads = 0
 if ($probe.Stdout -match 'threads=(\d+)') { $probeThreads = [int]$Matches[1] }
 Test-Assert ($probeThreads -ge 128) ("and raises the thread pool by itself (minimum " + $probeThreads + ")")
 
+# A script run the way a prompt runs it (& script, or .\script.ps1) holds
+# the kit's functions in its own scope, where a .GetNewClosure() block can't
+# see them. The kit makes them global too, so the batch (whose callbacks are
+# closures) and a caller's closure that calls a kit function both work.
+# Needs a fresh process, started with -Command rather than -File.
+$promptScript = Join-Path $env:TEMP ("pk-prompt-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($promptScript, @"
+. '$kitPath'
+`$b = Invoke-PkProcessBatch -Commands @(@{ FilePath = '$cmdExe'; Arguments = '/c exit 7' })
+Write-Output ('batch=' + `$b.Results.Count + ',' + `$b.Results[0].ExitCode)
+`$tag = 'ok'
+`$closure = Invoke-PkRun { Test-PkCancelRequested | Out-Null; 'closure=' + `$tag }.GetNewClosure()
+Write-Output `$closure
+"@)
+$prompt = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $promptScript + "'"))) -TimeoutMs 60000
+[System.IO.File]::Delete($promptScript)
+Test-Assert ($prompt.Stdout -match 'batch=1,7') ("a batch works in a script run from a prompt (" + ([string]$prompt.Stdout + [string]$prompt.Stderr).Trim() + ")")
+Test-Assert ($prompt.Stdout -match 'closure=ok') "and so does a .GetNewClosure() block that calls a kit function"
+# Pasted into a larger script under strict mode, only the kit's functions
+# are made global: the script's own (here one defined after the kit, and
+# one before) are left alone, and loading raises no errors.
+$embedScript = Join-Path $env:TEMP ("pk-embed-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($embedScript, "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nfunction Get-HarnessBefore { 1 }`r`n`$fnAst = 'mine'`r`n" +
+    [System.IO.File]::ReadAllText($kitPath) +
+    "`r`nfunction Get-HarnessAfter { 2 }`r`nWrite-Output ('kitGlobal=' + [bool](Get-ChildItem Function: | Where-Object { `$_.Name -eq 'Start-PkProcess' }))`r`nWrite-Output ('caller var=' + `$fnAst)`r`n")
+$embed = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $embedScript + "'; 'before global=' + [bool](Get-Command Get-HarnessBefore -ErrorAction SilentlyContinue); 'after global=' + [bool](Get-Command Get-HarnessAfter -ErrorAction SilentlyContinue); 'kit global=' + [bool](Get-Command Start-PkProcess -ErrorAction SilentlyContinue)"))) -TimeoutMs 60000
+[System.IO.File]::Delete($embedScript)
+$embedOut = ([string]$embed.Stdout + [string]$embed.Stderr).Trim()
+Test-Assert ($embedOut -match 'kit global=True' -and $embedOut -match 'before global=False' -and $embedOut -match 'after global=False' -and $embedOut -match 'caller var=mine' -and [string]::IsNullOrWhiteSpace([string]$embed.Stderr)) ("pasted into a larger script, only the kit's functions are made global, without errors or touching the script's variables (" + ($embedOut -replace '\s+', ' ') + ")")
+
 # Loading the kit in Constrained Language Mode fails with a message that
 # says so. Needs a fresh process: the mode can't be set back.
 $clmScript = Join-Path $env:TEMP ("pk-clm-" + [guid]::NewGuid().ToString("N") + ".ps1")
