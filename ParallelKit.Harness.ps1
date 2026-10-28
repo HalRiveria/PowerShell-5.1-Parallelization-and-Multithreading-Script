@@ -1263,6 +1263,44 @@ $j = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
 $null = Wait-PkProcess -Process $j.Proc -TimeoutMs 5000
 Test-Assert (-not (Stop-PkProcessTree -Process $j.Proc)) "Stop-PkProcessTree reports `$false for a program that already exited"
 $j.Proc.Dispose()
+
+# Every other place the kit kills a program kills its children too: a
+# Invoke-PkProcessWithTimeout overrun, and the dispatcher's force-stop
+# after an abort. Each test's ping has its own count, so a surviving one
+# can be found by its command line.
+function Get-HarnessPingCount([int]$Count) {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $Count + " 127.0.0.1*") }).Count
+}
+$nestedPing = { param($n) '/c ""' + $pingExe + '" -n ' + $n + ' 127.0.0.1"' }
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments (& $nestedPing 41) -TimeoutMs 1500 } catch { }  # the overrun throw is expected
+Test-Assert ((Get-HarnessPingCount 41) -eq 0) "Invoke-PkProcessWithTimeout: an overrun kills the program's children too"
+Reset-Harness
+$abortTimer = [PowerShell]::Create()
+$null = $abortTimer.AddScript({ [System.Threading.Thread]::Sleep(1500); [PkConsoleCtrl]::AbortRequested = $true })
+$abortTimerHandle = $abortTimer.BeginInvoke()
+$batch = Invoke-PkProcessBatch -AbortTimeoutSeconds 1 -Commands @(@{ FilePath = $cmdExe; Arguments = (& $nestedPing 43) })
+$null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
+$several = @(45, 46, 47 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing $_) })
+Start-Sleep -Milliseconds 500
+$killedSeveral = Stop-PkProcessTree -Process @($several | ForEach-Object { $_.Proc })
+Test-Assert ($killedSeveral -and (Get-HarnessPingCount 45) -eq 0 -and (Get-HarnessPingCount 46) -eq 0 -and (Get-HarnessPingCount 47) -eq 0 -and @($several | Where-Object { -not $_.Proc.HasExited }).Count -eq 0) "Stop-PkProcessTree kills several programs and their children in one call"
+foreach ($j in $several) { $j.Proc.Dispose() }
+# A parent and its own child in the same call: both die, and the call says
+# it killed them. (The case this guards - taskkill failing for one PID that
+# exited a moment before - is a race this can't set up on demand.)
+$parentJob = Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 48)
+$childProc = $null
+$waitChild = [System.Diagnostics.Stopwatch]::StartNew()
+while ($null -eq $childProc -and $waitChild.Elapsed.TotalSeconds -lt 5) {
+    $childCim = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $parentJob.Proc.Id) | Where-Object { $_.Name -eq 'PING.EXE' })
+    if ($childCim.Count -gt 0) { $childProc = [System.Diagnostics.Process]::GetProcessById([int]$childCim[0].ProcessId) } else { Start-Sleep -Milliseconds 100 }
+}
+$killedPair = $false
+if ($null -ne $childProc) { $killedPair = Stop-PkProcessTree -Process @($parentJob.Proc, $childProc) }
+Test-Assert ($null -ne $childProc -and $killedPair -and $parentJob.Proc.HasExited -and $childProc.HasExited) ("Stop-PkProcessTree kills a parent and its child passed together, and says so (found child: " + ($null -ne $childProc) + ", returned: " + $killedPair + ")")
+$parentJob.Proc.Dispose(); if ($null -ne $childProc) { $childProc.Dispose() }
+Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 1 -and (Get-HarnessPingCount 43) -eq 0) ("dispatch: the force-stop after an abort kills the program's children too (aborted=" + $batch.Aborted + ", force-killed=" + $batch.ForceKilledCount + ")")
+Reset-PkAbortState
 $threw = $false
 try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -TimeoutSeconds -1 } catch { $threw = ($_.ToString() -like '*-TimeoutSeconds*') }
 Test-Assert $threw "a negative -TimeoutSeconds is refused"
