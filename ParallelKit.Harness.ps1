@@ -1250,6 +1250,11 @@ $null = $abortTimer.AddScript({ [System.Threading.Thread]::Sleep(1500); [PkConso
 $abortTimerHandle = $abortTimer.BeginInvoke()
 $batch = Invoke-PkProcessBatch -AbortTimeoutSeconds 1 -Commands @(@{ FilePath = $cmdExe; Arguments = (& $nestedPing 43) })
 $null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
+$several = @(45, 46, 47 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing $_) })
+Start-Sleep -Milliseconds 500
+$killedSeveral = Stop-PkProcessTree -Process @($several | ForEach-Object { $_.Proc })
+Test-Assert ($killedSeveral -and (Get-HarnessPingCount 45) -eq 0 -and (Get-HarnessPingCount 46) -eq 0 -and (Get-HarnessPingCount 47) -eq 0 -and @($several | Where-Object { -not $_.Proc.HasExited }).Count -eq 0) "Stop-PkProcessTree kills several programs and their children in one call"
+foreach ($j in $several) { $j.Proc.Dispose() }
 Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 1 -and (Get-HarnessPingCount 43) -eq 0) ("dispatch: the force-stop after an abort kills the program's children too (aborted=" + $batch.Aborted + ", force-killed=" + $batch.ForceKilledCount + ")")
 Reset-PkAbortState
 $threw = $false
