@@ -1148,8 +1148,10 @@ function Invoke-PkProcessBatch {
     # Each command is @{ FilePath = ...; Arguments = ...; WorkingDirectory = ... (optional); <anything else> }.
     # $OnComplete { param($command, $result) } fires as each one finishes
     # (not for one that couldn't start or was stopped by an abort).
+    # $TimeoutSeconds > 0 kills a program still running after that long; its
+    # result has TimedOut = $true (0 = no limit).
     # Returns @{ Results; Aborted; ForceKilledCount }; each result is
-    # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted },
+    # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted; TimedOut },
     # every field always present - keep the three places that build one in sync.
     # $Commands may be $null: a foreach that matches nothing yields $null, not
     # an empty array, and an empty batch should just return no results.
@@ -1160,8 +1162,11 @@ function Invoke-PkProcessBatch {
         [hashtable[]]$Commands,
         [int]$MaxConcurrent = 4,
         [scriptblock]$OnComplete = $null,
-        [int]$AbortTimeoutSeconds = 60
+        [int]$AbortTimeoutSeconds = 60,
+        [int]$TimeoutSeconds = 0
     )
+
+    if ($TimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
     $results = [System.Collections.Generic.List[hashtable]]::new()
     $state   = @{ Given = $false }
@@ -1187,17 +1192,18 @@ function Invoke-PkProcessBatch {
         try {
             $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory']
         } catch {
-            $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = [string]$_; Aborted = $false })
+            $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = [string]$_; Aborted = $false; TimedOut = $false })
             throw
         }
         $job['Proc'] = $started.Proc; $job['StdoutTask'] = $started.StdoutTask; $job['StderrTask'] = $started.StderrTask
+        $job['Stopwatch'] = $started.Stopwatch; $job['TimedOut'] = $false
         return $job
     }.GetNewClosure()
 
     $jobFinalize = {
         param($job, $pendingQueue)
         $r = Complete-PkProcess -Job $job
-        $r.Command = $job['Command']; $r.StartError = $null; $r.Aborted = $false
+        $r.Command = $job['Command']; $r.StartError = $null; $r.Aborted = $false; $r.TimedOut = [bool]$job['TimedOut']
         $results.Add($r)
         if ($null -ne $OnComplete) { $null = & $OnComplete $job['Command'] $r }
         return @{ Success = ($r.ExitCode -eq 0) }
@@ -1205,12 +1211,27 @@ function Invoke-PkProcessBatch {
 
     $jobAbortCleanup = {
         param($job)
-        $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = $null; Aborted = $true })
+        $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = $null; Aborted = $true; TimedOut = $false })
     }.GetNewClosure()
 
-    $dispatch = Invoke-PkProcessDispatch -GroupProvider $groupProvider -JobBuilder $jobBuilder -JobStarter $jobStarter `
-        -JobFinalize $jobFinalize -JobAbortCleanup $jobAbortCleanup -MaxConcurrent $MaxConcurrent `
-        -AbortTimeoutSeconds $AbortTimeoutSeconds -MaxQueueAhead 1
+    $dispatchParams = @{
+        GroupProvider = $groupProvider; JobBuilder = $jobBuilder; JobStarter = $jobStarter
+        JobFinalize = $jobFinalize; JobAbortCleanup = $jobAbortCleanup; MaxConcurrent = $MaxConcurrent
+        AbortTimeoutSeconds = $AbortTimeoutSeconds; MaxQueueAhead = 1
+    }
+    if ($TimeoutSeconds -gt 0) {
+        # Kill an overrunning program; the next poll sees it exited and it
+        # goes through $jobFinalize like any other, flagged TimedOut.
+        $dispatchParams['JobPollCompleted'] = {
+            param($job)
+            if (-not $job['Proc'].HasExited -and $job['Stopwatch'].Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $job['TimedOut'] = $true
+                try { $job['Proc'].Kill() } catch { }  # it may have exited between the check and the kill
+            }
+            return $job['Proc'].HasExited
+        }.GetNewClosure()
+    }
+    $dispatch = Invoke-PkProcessDispatch @dispatchParams
 
     return @{ Results = $results; Aborted = $dispatch.Aborted; ForceKilledCount = $dispatch.ForceKilledCount }
 }

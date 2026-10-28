@@ -1049,7 +1049,7 @@ Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
 # Every batch result has every documented field, so a strict-mode caller
 # can read any of them without a "property cannot be found" error.
 Reset-Harness
-$fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted')
+$fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut')
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
     @{ FilePath = $cmdExe; Arguments = '/c exit 0' },
     @{ FilePath = 'C:\definitely\not\here.exe' })
@@ -1064,6 +1064,23 @@ $missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $
 Test-Assert ($batch.Aborted -and $batch.Results.Count -eq 2 -and @($batch.Results | Where-Object { $_.Aborted }).Count -eq 2) "batch: commands an abort kept from starting come back marked Aborted"
 Test-Assert (@($missing).Count -eq 0) ("and their results carry every field too (missing: " + (@($missing) -join ', ') + ")")
 Reset-PkAbortState
+
+# -TimeoutSeconds kills a program that overruns; the rest run normally.
+Reset-Harness
+$completed = [System.Collections.Generic.List[object]]::new()
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$batch = Invoke-PkProcessBatch -MaxConcurrent 2 -TimeoutSeconds 2 -OnComplete { param($c, $r) $completed.Add($r) }.GetNewClosure() -Commands @(
+    @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; Name = 'slow' },
+    @{ FilePath = $cmdExe; Arguments = '/c exit 0'; Name = 'fast' })
+$sw.Stop()
+$slow = @($batch.Results | Where-Object { $_.Command['Name'] -eq 'slow' })
+$fast = @($batch.Results | Where-Object { $_.Command['Name'] -eq 'fast' })
+Test-Assert ($slow.Count -eq 1 -and $slow[0].TimedOut -and $slow[0].ExitCode -ne 0 -and $sw.Elapsed.TotalSeconds -lt 15) ("batch: -TimeoutSeconds kills an overrunning program and marks it TimedOut (" + [int]$sw.Elapsed.TotalSeconds + "s)")
+Test-Assert ($fast.Count -eq 1 -and -not $fast[0].TimedOut -and $fast[0].ExitCode -eq 0 -and -not $batch.Aborted) "and the others finish normally, not TimedOut"
+Test-Assert ($completed.Count -eq 2) "a timed-out program still goes through -OnComplete"
+$threw = $false
+try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -TimeoutSeconds -1 } catch { $threw = ($_.ToString() -like '*-TimeoutSeconds*') }
+Test-Assert $threw "a negative -TimeoutSeconds is refused"
 
 # An aborted group still gets -GroupCompleteCallback (the README warns about
 # this - a caller zipping a folder there must check for the abort first).
