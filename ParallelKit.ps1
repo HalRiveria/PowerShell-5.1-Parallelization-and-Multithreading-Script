@@ -2191,3 +2191,25 @@ function Test-PkWorkerSafety {
 
     return ,$findings
 }
+
+# ==============================================================================
+#  Make the kit's functions global
+# ==============================================================================
+
+# Dot-sourced inside a script run from a prompt (.\script.ps1 or & script),
+# the functions above exist only in that script's scope. A .GetNewClosure()
+# block - the batch's own callbacks, or yours - can only see global
+# functions, so it couldn't find them. Defining each one globally too means
+# kit functions work from any closure, however the script was started.
+# Only the kit's own functions (Pk-named, plus Initialize-ParallelKit): the
+# kit may be pasted into a larger script whose other functions are none of
+# its business. Run in a child scope so the loop's variables don't touch
+# the caller's.
+& {
+    param($kitAst)
+    foreach ($fnAst in $kitAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        if ($fnAst.Name -notlike '*-Pk*' -and $fnAst.Name -ne 'Initialize-ParallelKit') { continue }
+        $fn = Get-Item -LiteralPath ("Function:\" + $fnAst.Name) -ErrorAction SilentlyContinue
+        if ($null -ne $fn) { $null = Set-Item -Path ("Function:\global:" + $fnAst.Name) -Value $fn.ScriptBlock }
+    }
+} $MyInvocation.MyCommand.ScriptBlock.Ast
