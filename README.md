@@ -62,7 +62,7 @@ Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C. (For `Invoke-
 
 For running PowerShell code in parallel, most of these are fine and some are simpler. ParallelKit is mainly about running external programs, and about what happens when a run is stopped partway through.
 
-- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer if you can use PowerShell 7. ParallelKit is for scripts and machines that are stuck on 5.1. Why not use PowerShell 7? Because I don't wanna.
+- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer if you can use PowerShell 7. ParallelKit is for scripts and machines that are stuck on 5.1.
 - **`Start-Job`.** Built in, but each job is a whole new `powershell.exe` process, so every job costs noticeable startup time and memory, and what it returns comes back as serialized copies (properties only, no methods). 5.1's `Start-Job` has no throttle either, so you write the wait-for-a-free-slot loop yourself. Fine for a handful of long jobs, poor for thousands of short ones.
 - **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (it ships with PowerShell 7, not 5.1).
 - **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. For this purpose it has the same strengths and gaps as ThreadJob.
