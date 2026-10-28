@@ -406,12 +406,8 @@ $f = Test-PkWorkerSafety -WorkerScript { param($Id) Get-HarnessUnsafeState } -Sh
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'ScriptVariable') "a shared function using `$script: is flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $script:top = 1; $sb = { $script:nested = 2 } }
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'ScriptVariable') "in the worker body, only `$script: inside a nested scriptblock is flagged"
-$f = Test-PkWorkerSafety -WorkerScript { param($Id) Start-Sleep -Milliseconds 5; Get-HarnessUsesCmdlet } -SharedFunctionNames @('Get-HarnessUsesCmdlet')
-Test-Assert (@($f | Where-Object { $_.Rule -eq 'Cmdlet' }).Count -eq 2) "cmdlets are flagged in the worker body and in shared functions"
-$f = Test-PkWorkerSafety -WorkerScript { param($Id) @(1, 2) | ForEach-Object { $_ } }
-Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'Cmdlet') "a pipeline cmdlet is flagged"
-$f = Test-PkWorkerSafety -WorkerScript { param($Id) sleep 1; 1..2 | % { $_ }; & 'Get-Date' }
-Test-Assert (@($f | Where-Object { $_.Rule -eq 'Cmdlet' }).Count -eq 3) ("cmdlets are still caught through aliases and a literal & call (got " + @($f | Where-Object { $_.Rule -eq 'Cmdlet' }).Count + ")")
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) Start-Sleep -Milliseconds 5; @(1, 2) | Where-Object { $_ -gt 1 } | ForEach-Object { $_ }; Get-HarnessUsesCmdlet } -SharedFunctionNames @('Get-HarnessUsesCmdlet')
+Test-Assert ($f.Count -eq 0) ("cmdlets, including ones that take a scriptblock, pass the check in the worker body and in shared functions (got " + $f.Count + " finding(s))")
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) Get-HarnessDelegate } -SharedFunctionNames @('Get-HarnessDelegate')
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a scriptblock-to-delegate cast is flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) Get-HarnessIgnored } -SharedFunctionNames @('Get-HarnessIgnored')
@@ -419,8 +415,41 @@ Test-Assert ($f.Count -eq 0) "'# pk:ignore' on the line accepts a finding"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) Write-PkMessage "x"; if (Test-PkCancelRequested) { return }; $null = Start-PkProcess -FilePath 'x' }
 Test-Assert ($f.Count -eq 0) "the kit's own worker functions never need listing"
 $threw = $false
-try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) Start-Sleep 1 } -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 -CheckWorkerSafety } catch { $threw = ($_.ToString() -like '*Start-Sleep*') }
+try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) $null = [Func[int]]{ 1 } } -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 -CheckWorkerSafety } catch { $threw = ($_.ToString() -like '*Func*') }
 Test-Assert $threw "-CheckWorkerSafety refuses to launch unsafe worker code, naming the problem"
+$threw = $false
+try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) $null = [Func[int]]{ 1 } } -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 } catch { $threw = ($_.ToString() -like '*Func*') }
+Test-Assert $threw "the worker-safety check runs without being asked"
+$out = $null
+try { $out = Invoke-PkRunspaceJobs -WorkerScript { param($Id) $null = [Func[int]]{ 1 } } -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 -CheckWorkerSafety:$false } catch { Write-Host "  opt-out threw: $_" }
+Test-Assert ($null -ne $out -and $out.CrashedCount -eq 0) "-CheckWorkerSafety:`$false turns the check off"
+$results = [System.Collections.Generic.List[object]]::new()
+$out = Invoke-PkRunspaceJobs -WorkerScript { param($Id) return @(1, 2, 3) | Where-Object { $_ -gt 1 } | Measure-Object -Sum | ForEach-Object { $_.Sum + $Id } } `
+    -JobParams (New-JobList -Jobs @(@{ Id = 10 }, @{ Id = 20 })) -MaxParallel 2 -ResultHandler { param($r) $results.Add($r) }.GetNewClosure()
+Test-Assert ($out.CrashedCount -eq 0 -and (@($results | Sort-Object) -join ',') -eq '15,25') "workers can run cmdlets, including ones that take a scriptblock"
+$results = [System.Collections.Generic.List[object]]::new()
+$out = Invoke-PkRunspaceJobs -WorkerScript { param($Path) return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } `
+    -JobParams (New-JobList -Jobs @(@{ Path = $cmdExe })) -MaxParallel 1 -ResultHandler { param($r) $results.Add($r) }.GetNewClosure()
+Test-Assert ($out.CrashedCount -eq 0 -and $results.Count -eq 1 -and $results[0] -eq (Get-FileHash -LiteralPath $cmdExe -Algorithm SHA256).Hash) "a function from a module (Get-FileHash) needn't be shared, and autoloads in the worker"
+
+# A scriptblock passed as a job value runs against the main thread's session
+# state - refused at launch, with the pass-as-text workaround.
+$mainThreadBlock = { param($x) $x * 2 }
+$threw = $false
+try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Fn) } -JobParams (New-JobList -Jobs @(@{ Fn = 'ok' }, @{ Fn = $mainThreadBlock })) -MaxParallel 1 } catch { $threw = ($_.ToString() -like "*job 1*'Fn'*Create*Nothing was started*") }
+Test-Assert $threw "a scriptblock job value is refused before any worker starts, naming the job and key"
+$threw = $false
+try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Fns) } -JobParams (New-JobList -Jobs @(@{ Fns = @(1, $mainThreadBlock) })) -MaxParallel 1 } catch { $threw = ($_.ToString() -like "*'Fns'*") }
+Test-Assert $threw "a scriptblock inside an array job value is refused too"
+$threw = $false
+$providerState = @{ Given = 0 }
+$provider = { if ($providerState.Given -ge 2) { return $null }; $providerState.Given++; if ($providerState.Given -eq 2) { return @{ Fn = $mainThreadBlock } }; return @{ Fn = 'ok' } }.GetNewClosure()
+try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Fn) } -NextJobProvider $provider -MaxParallel 1 } catch { $threw = ($_.ToString() -like "*-NextJobProvider*'Fn'*") }
+Test-Assert $threw "a scriptblock job value from -NextJobProvider is refused"
+$results = [System.Collections.Generic.List[object]]::new()
+$out = Invoke-PkRunspaceJobs -WorkerScript { param($FnText, $Id) $fn = [scriptblock]::Create($FnText); return (& $fn $Id) } `
+    -JobParams (New-JobList -Jobs @(@{ FnText = $mainThreadBlock.ToString(); Id = 4 })) -MaxParallel 1 -ResultHandler { param($r) $results.Add($r) }.GetNewClosure()
+Test-Assert ($out.CrashedCount -eq 0 -and $results.Count -eq 1 -and $results[0] -eq 8) "the pass-as-text workaround runs"
 Write-Host ""
 
 # ==============================================================================
@@ -629,6 +658,12 @@ $f = Test-PkWorkerSafety -WorkerScript { param($Id) $lazy = [System.Lazy[object]
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a scriptblock passed to a .NET constructor is flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $x = @(1, 2).ForEach({ $_ }); $y = @(1, 2).Where({ $_ }); $z = { 1 }.GetNewClosure() }
 Test-Assert ($f.Count -eq 0) "PowerShell's own .ForEach()/.Where()/.GetNewClosure() are not flagged"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $factory = { 1 }; $lazy = [System.Lazy[object]]::new($factory) }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast' -and $f[0].Text -like '*$factory*') "a variable holding a scriptblock, passed to a .NET constructor, is flagged by name"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $add = { param($k, $old) $old + 1 }.GetNewClosure(); $d = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new(); $null = $d.AddOrUpdate('a', 1, $add) }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a variable holding a .GetNewClosure() block, passed to a .NET method, is flagged"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $sb = { $_ * 2 }; $n = 'x'; $x = @(1, 2).ForEach($sb); $null = $n.Contains($n) }
+Test-Assert ($f.Count -eq 0) "a scriptblock variable given to .ForEach(), and other variables given to .NET methods, are not flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $list = [System.Collections.Generic.List[scriptblock]]::new(); $list.Add({ 1 })  # pk:ignore
 }
 Test-Assert ($f.Count -eq 0) "'# pk:ignore' accepts a method that really does take a scriptblock"
