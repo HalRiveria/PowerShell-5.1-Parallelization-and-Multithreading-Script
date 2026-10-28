@@ -13,7 +13,7 @@ It was pulled out of [Manga Conversion Script](https://github.com/HalRiveria/Man
 
 Built with Claude Code.
 
-**Contents:** [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Why Not Use X?](#why-not-use-x) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The three rules for worker code](#the-three-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing) · [FAQ](#faq)
+**Contents:** [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Why Not Use X?](#why-not-use-x) · [Setup](#setup) · [Run a list of programs](#run-a-list-of-programs) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The two rules for worker code](#the-two-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing) · [FAQ](#faq)
 
 ## Quick start
 
@@ -136,13 +136,10 @@ Each command is a hashtable with `FilePath`, `Arguments` and optionally `Working
 ## Run PowerShell code in parallel
 
 ```powershell
-# Worker code may only use .NET calls, not cmdlets - see "The three rules" below.
+# Worker code can use cmdlets - see "The two rules" below for what it can't do.
 function Get-FileSha {
     param([string]$Path)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $stream = [System.IO.File]::OpenRead($Path)
-    try { return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
-    finally { $stream.Dispose(); $sha.Dispose() }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
 $jobs = [System.Collections.Generic.List[hashtable]]::new()
@@ -153,7 +150,6 @@ $jobsParams = @{
     MaxParallel         = 4
     JobParams           = $jobs
     SharedFunctionNames = @('Get-FileSha')
-    CheckWorkerSafety   = $true
     WorkerScript        = {
         param([string]$Path)
         if (Test-PkCancelRequested) { return }
@@ -178,27 +174,25 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
 - Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
 
-## The three rules for worker code
+## The two rules for worker code
 
 These only apply if you run PowerShell code in parallel with `Invoke-PkRunspaceJobs` (or call a dispatcher from inside one of its workers). Running external programs with `Invoke-PkProcessBatch` or `Invoke-PkProcessDispatch` on the main thread never touches them.
 
-Worker code is the worker script, every function in `-SharedFunctionNames`, and anything they call. Breaking these rules doesn't fail loudly. It hangs, or quietly reads nothing.
+Worker code is the worker script, every function in `-SharedFunctionNames`, and anything they call. Breaking these rules doesn't fail loudly. It hangs, crashes, or quietly reads nothing.
 
 1. **No `$script:` variables.** In a worker they can silently read as empty. Pass state in as job parameters. (`$script:` at the very top level of the worker script is fine; inside a function or a nested `{ }` block it isn't.)
-2. **No cmdlets.** Two fresh runspaces calling the same cmdlet for the first time at the same moment can deadlock in PowerShell 5.1. Use .NET calls: `[System.IO.File]::Exists($p)` instead of `Test-Path`, `[System.Threading.Thread]::Sleep(100)` instead of `Start-Sleep`, a `foreach` loop instead of `ForEach-Object`, `$null = ...` instead of `| Out-Null`, `[DateTime]::Now` instead of `Get-Date`, `Write-PkMessage` instead of `Write-Host`.
-3. **No scriptblocks handed to .NET as delegates** (`[Func[...]]{ }`, `[Action]{ }`, `System.Lazy`, `ConcurrentDictionary.GetOrAdd($k, { })`). Nested, they deadlock. Use plain loops and `[System.Threading.Monitor]`.
+2. **A scriptblock only runs in the runspace that made it.** Don't hand one to .NET as a delegate (`[Func[...]]{ }`, `[Action]{ }`, `System.Lazy`, `ConcurrentDictionary.GetOrAdd($k, { })`): use plain loops and `[System.Threading.Monitor]` instead. Don't pass one in as a job value either: pass its text (`$sb.ToString()`) and rebuild it in the worker with `[scriptblock]::Create($text)`.
 
-Only worker code is affected. Callbacks that run on the main thread (`-ResultHandler`, `-PollCallback`, `-NextJobProvider`, `-OnComplete`, the message handler) are not worker code and can use anything, cmdlets included.
+Everything else is fine in a worker, cmdlets included. Callbacks that run on the main thread (`-ResultHandler`, `-PollCallback`, `-NextJobProvider`, `-OnComplete`, the message handler) are not worker code and can use anything.
 
-`Test-PkWorkerSafety -WorkerScript $w -SharedFunctionNames $names` checks all three, plus missing shared functions, and returns a list of findings. For rule 3 it flags both written casts and scriptblocks passed straight into a .NET call. Call it from your tests, or pass `-CheckWorkerSafety` to `Invoke-PkRunspaceJobs` to refuse to launch unsafe code. `# pk:ignore` on a line accepts a finding. It can't see callbacks you pass to a worker as job parameters, or commands run through a variable (`& $cmd`).
+`Invoke-PkRunspaceJobs` checks both rules before it starts anything, and refuses to launch code that breaks them, naming the line or the job key. Pass `-CheckWorkerSafety:$false` to turn that off. The code check is also available on its own as `Test-PkWorkerSafety -WorkerScript $w -SharedFunctionNames $names`, which returns a list of findings (including functions the worker calls but you didn't share), for use in your own tests. For rule 2 it flags both written casts and scriptblocks passed straight into a .NET call. `# pk:ignore` on a line accepts a finding. It can't see commands run through a variable (`& $cmd`), or a scriptblock buried more than one level deep in a job value.
 
 ### Why these rules exist
 
-"No cmdlets" in PowerShell code sounds extreme, so here's where each rule comes from. All three were found chasing real, intermittent hangs, and none of them is in Microsoft's documentation as far as we could find.
+Both were found chasing real, intermittent failures, and neither is in Microsoft's documentation as far as we could find.
 
-- **Cmdlets.** The first time a cmdlet runs in a fresh runspace, PowerShell 5.1 sets it up, and that setup isn't safe when two runspaces do it at the same moment. With just two workers, the original project hung in roughly 1 run in 8. Every cmdlet tried could trigger it, down to `Start-Sleep` and `Out-Null`. Replacing every cmdlet on the worker side with .NET calls took that to 0 hangs in 50 stress runs. The kit's own worker-side functions follow the same rule.
 - **`$script:` variables.** A function listed in `-SharedFunctionNames` is recreated inside the worker from its source text, so it's no longer attached to your script and its `$script:` points somewhere else. Inside a `.GetNewClosure()` block, `$script:` points at a private copy. Either way the read comes back empty, with no error.
-- **Delegates.** When .NET calls a scriptblock through a delegate, PowerShell can hand the call to the runspace's own thread instead of running it on the spot. Nested, the inner call waits for a thread that is itself waiting on that call. It's timing-dependent: it showed up in about 1 or 2 runs in 100, and was only pinned down from process dumps.
+- **Scriptblocks.** A scriptblock belongs to the runspace that created it, and runs against that runspace's session state wherever it's called from ([PowerShell issue #4003](https://github.com/PowerShell/PowerShell/issues/4003)). When a delegate makes .NET call one from another runspace's thread, PowerShell can hand the call back to the owning runspace's thread. If that thread is itself waiting, and the scriptblock runs another scriptblock inside it (a `Where-Object { }` filter, a nested delegate), it deadlocks. Even when it doesn't deadlock, two threads using one session state at once can crash the process. A scriptblock passed in as a job value is the same case: in stress tests, 8 workers running one passed from the main thread broke 88 of 90 runs, usually by corrupting the main thread's session state so the kit's own functions vanished mid-run, even when the scriptblock held nothing but .NET calls. Passed as text and rebuilt in the worker, the same code ran clean in all 30 runs.
 
 ## Process dispatch with groups
 
@@ -309,17 +303,13 @@ GitHub runs the same harness on Windows PowerShell 5.1 for every pull request an
 
 ## FAQ
 
-**No cmdlets? Isn't the point of PowerShell to use cmdlets?**
+**Can I use cmdlets in worker code?**
 
-The rule only covers code running inside `Invoke-PkRunspaceJobs` workers. Your main script, every main-thread callback, and the whole external-program side (`Invoke-PkProcessBatch`, `Invoke-PkProcessDispatch`) when called from your main script can use cmdlets freely. Inside workers it's because of a race in PowerShell 5.1: two fresh runspaces running the same cmdlet for the first time at the same moment can deadlock. [Why these rules exist](#why-these-rules-exist) has the details.
+Yes. What a worker can't do is run a scriptblock that came from another runspace: one handed to .NET as a delegate, or one passed in as a job value. [The two rules](#the-two-rules-for-worker-code) cover it, and the kit checks for both before it starts.
 
-**What happens if I use a cmdlet in a worker anyway?**
+**Do ThreadJob and PoshRSJob have the same scriptblock problem?**
 
-Most runs work. Some hang at random, with no error. In the original project it was about 1 run in 8 with just two workers, so a test run passing tells you very little. `-CheckWorkerSafety` refuses to start worker code that uses a cmdlet, and `# pk:ignore` on a line accepts it if you've decided the risk is fine.
-
-**Do ThreadJob and PoshRSJob have the same cmdlet problem?**
-
-It hasn't been tested with them. The race is in how PowerShell 5.1 sets up cmdlets in a new runspace, not in this kit, so other runspace-based tools on 5.1 may hit it too, but that's not something that's been reproduced.
+It hasn't been tested with them. The cause is in PowerShell itself, not in this kit: a scriptblock stays tied to the runspace that made it. So any runspace-based tool that lets a scriptblock cross from one runspace to another can hit it. This kit refuses to launch when it sees one.
 
 **Does it work in PowerShell 7, or on Linux or macOS?**
 
