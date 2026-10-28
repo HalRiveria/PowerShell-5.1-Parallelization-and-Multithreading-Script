@@ -93,7 +93,9 @@ If you downloaded the file, Windows marks it as coming from the internet and you
 
 It works whether or not your script uses `Set-StrictMode`.
 
-Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`. Its functions are also defined globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started.
+Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
+
+The kit's functions are also defined globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started.
 
 `Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
