@@ -209,6 +209,32 @@ if ($compiled) {
     Test-Assert (($received -join '|') -eq ($expected -join '|')) ("a program receives exactly the arguments given (got " + ($received -join ' ') + ")")
     try { [System.IO.File]::Delete($argvExe) } catch { }  # temp file only; best effort
 }
+
+# -OutputEncoding: a program that writes UTF-8 bytes comes back intact when
+# told so, and garbled when decoded as code page 437 (a default console).
+$u8Exe = Join-Path $env:TEMP ("pk-u8-" + [guid]::NewGuid().ToString("N") + ".exe")
+$u8Src = [System.IO.Path]::ChangeExtension($u8Exe, '.cs')
+[System.IO.File]::WriteAllText($u8Src, 'public static class PkU8 { public static void Main() { string t = new string(new char[] { (char)0x63, (char)0x61, (char)0x66, (char)0xE9, (char)0x20, (char)0x65E5, (char)0x672C, (char)0x8A9E }); byte[] b = new System.Text.UTF8Encoding(false).GetBytes(t); var o = System.Console.OpenStandardOutput(); o.Write(b, 0, b.Length); o.Flush(); var e = System.Console.OpenStandardError(); e.Write(b, 0, b.Length); e.Flush(); } }')
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $u8Exe), $u8Src)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($u8Src)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($u8Exe))
+Test-Assert $compiled "the UTF-8 test program compiles"
+if ($compiled) {
+    $u8Text = 'caf' + [char]0xE9 + ' ' + [char]0x65E5 + [char]0x672C + [char]0x8A9E
+    $r = Invoke-PkProcessWithTimeout -FilePath $u8Exe -OutputEncoding 'utf-8'
+    $codes = { param($s) (([string]$s).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ' }
+    Test-Assert ($r.Stdout -eq $u8Text -and $r.Stderr -eq $u8Text) ("-OutputEncoding 'utf-8' decodes a program's UTF-8 output, stdout and stderr (got " + (& $codes $r.Stdout) + " / " + (& $codes $r.Stderr) + ")")
+    $r = Invoke-PkProcessWithTimeout -FilePath $u8Exe -OutputEncoding 437
+    Test-Assert ($r.Stdout -ne $u8Text) "and decoding it as code page 437 garbles it, so the option really takes effect"
+    $batch = Invoke-PkProcessBatch -OutputEncoding 'utf8' -Commands @(@{ FilePath = $u8Exe; Name = 'default' }, @{ FilePath = $u8Exe; Name = 'own'; OutputEncoding = 437 })
+    $byName = @{}; foreach ($br in $batch.Results) { $byName[$br.Command['Name']] = $br.Stdout }
+    Test-Assert ($byName['default'] -eq $u8Text -and $byName['own'] -ne $u8Text) "batch: -OutputEncoding applies to every command, and a command's own OutputEncoding key overrides it"
+    try { [System.IO.File]::Delete($u8Exe) } catch { }  # temp file only; best effort
+}
+$threw = $false
+try { $null = Invoke-PkProcessBatch -OutputEncoding 'no-such-encoding' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) } catch { $threw = ($_.ToString() -like "*'no-such-encoding' isn't an encoding*") }
+Test-Assert $threw "an unknown -OutputEncoding fails the call with a clear message"
 Write-Host ""
 
 # ==============================================================================

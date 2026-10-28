@@ -119,6 +119,8 @@ Long parameter lists in these examples use splatting (`@batchParams`) instead of
 
 Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
 
+Output is decoded in the console's code page unless you say otherwise, which is right for Windows' own tools. Many cross-platform tools write UTF-8 instead, and their non-ASCII output (accented or Japanese file names, say) comes back garbled. Pass `-OutputEncoding 'utf-8'` for the whole batch, or put an `OutputEncoding` key on one command. It also takes a code page number (`65001`, `437`) or a `[System.Text.Encoding]`, and the same option exists on `Invoke-PkProcessWithTimeout` and `Start-PkProcess` (and as a job key for the dispatcher's default starter).
+
 `Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted; TimedOut }`, with every field always present:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.

@@ -569,16 +569,37 @@ function ConvertTo-PkArgumentString {
     return ($parts -join ' ')
 }
 
+function Resolve-PkEncoding {
+    # -OutputEncoding as given (an Encoding, a code page number, or a name
+    # like 'utf-8' or 'utf8') -> an Encoding, or $null for "not set".
+    param($Encoding)
+    if ($null -eq $Encoding -or ($Encoding -is [string] -and $Encoding -eq '')) { return $null }
+    if ($Encoding -is [System.Text.Encoding]) { return $Encoding }
+    # .NET Framework doesn't know the name 'utf8'; no BOM either way, since
+    # this only decodes.
+    if ($Encoding -is [string] -and $Encoding -in @('utf8', 'utf-8')) { return [System.Text.UTF8Encoding]::new($false) }
+    try {
+        if ($Encoding -is [int]) { return [System.Text.Encoding]::GetEncoding([int]$Encoding) }
+        return [System.Text.Encoding]::GetEncoding([string]$Encoding)
+    } catch {
+        throw ("OutputEncoding '" + $Encoding + "' isn't an encoding .NET knows. Use a name like 'utf-8' or 'windows-1252', or a code page number like 65001.")
+    }
+}
+
 function Start-PkProcess {
     # Starts a hidden child process with stdout/stderr redirected and being
     # read asynchronously (so a chatty process can't block on a full pipe).
+    # $OutputEncoding is how the program's output is decoded ('utf-8', a
+    # code page number, or an Encoding); unset, it's the console's code page.
     # Returns @{ Proc; StdoutTask; StderrTask; Stopwatch }.
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
         [string]$Arguments = "",
-        [string]$WorkingDirectory = ""
+        [string]$WorkingDirectory = "",
+        $OutputEncoding = $null
     )
+    $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
     # Self-starting: a caller who never ran Initialize-ParallelKit still
     # gets children that die with the script, and output reads that
     # aren't starved of threads. Both are cheap no-ops once done.
@@ -589,6 +610,10 @@ function Start-PkProcess {
     $psi.FileName               = $FilePath
     $psi.Arguments              = $Arguments
     $psi.UseShellExecute        = $false
+    if ($null -ne $encoding) {
+        $psi.StandardOutputEncoding = $encoding
+        $psi.StandardErrorEncoding  = $encoding
+    }
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $psi.CreateNoWindow         = $true
@@ -703,11 +728,12 @@ function Invoke-PkProcessWithTimeout {
         [int]$TimeoutMs = 60000,
         [int]$StreamTimeoutMs = 15000,
         [string]$WorkingDirectory = "",
+        $OutputEncoding = $null,
         # For a program that has to run BECAUSE of an abort (cleanup, a
         # restore step): keep going even though the run is being aborted.
         [switch]$IgnoreAbort
     )
-    $job = Start-PkProcess -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory
+    $job = Start-PkProcess -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding
     try {
         # Wait in short slices so Ctrl+C (or the run's cancel token) is
         # noticed within a moment, not after the whole time limit.
@@ -806,7 +832,7 @@ function Invoke-PkProcessDispatch {
     if ($null -eq $JobStarter) {
         $JobStarter = {
             param($job)
-            $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments ([string]$job['Arguments']) -WorkingDirectory ([string]$job['WorkingDirectory'])
+            $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments ([string]$job['Arguments']) -WorkingDirectory ([string]$job['WorkingDirectory']) -OutputEncoding $job['OutputEncoding']
             $job['Proc'] = $started.Proc; $job['StdoutTask'] = $started.StdoutTask; $job['StderrTask'] = $started.StderrTask
             $job['Stopwatch'] = $started.Stopwatch
             return $job
@@ -1223,7 +1249,8 @@ function Invoke-PkProcessDispatchCore {
 
 function Invoke-PkProcessBatch {
     # The simple case: run a flat list of commands, $MaxConcurrent at a time.
-    # Each command is @{ FilePath = ...; Arguments = ...; WorkingDirectory = ... (optional); <anything else> }.
+    # Each command is @{ FilePath = ...; Arguments = ...; WorkingDirectory = ... (optional);
+    # OutputEncoding = ... (optional, overrides -OutputEncoding); <anything else> }.
     # $OnComplete { param($command, $result) } fires as each one finishes
     # (not for one that couldn't start or was stopped by an abort).
     # $TimeoutSeconds > 0 kills a program still running after that long; its
@@ -1241,8 +1268,12 @@ function Invoke-PkProcessBatch {
         [int]$MaxConcurrent = 4,
         [scriptblock]$OnComplete = $null,
         [int]$AbortTimeoutSeconds = 60,
-        [int]$TimeoutSeconds = 0
+        [int]$TimeoutSeconds = 0,
+        $OutputEncoding = $null
     )
+
+    # Checked once here, so a bad name fails the call instead of every command.
+    $null = Resolve-PkEncoding -Encoding $OutputEncoding
 
     if ($TimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
@@ -1260,7 +1291,9 @@ function Invoke-PkProcessBatch {
         $jobs = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($c in $Commands) {
             if ($null -eq $c) { continue }
-            $jobs.Add(@{ FilePath = $c['FilePath']; Arguments = [string]$c['Arguments']; WorkingDirectory = [string]$c['WorkingDirectory']; Command = $c })
+            $encoding = $OutputEncoding
+            if ($c.ContainsKey('OutputEncoding')) { $encoding = $c['OutputEncoding'] }
+            $jobs.Add(@{ FilePath = $c['FilePath']; Arguments = [string]$c['Arguments']; WorkingDirectory = [string]$c['WorkingDirectory']; OutputEncoding = $encoding; Command = $c })
         }
         return $jobs
     }.GetNewClosure()
@@ -1268,7 +1301,7 @@ function Invoke-PkProcessBatch {
     $jobStarter = {
         param($job)
         try {
-            $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory']
+            $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory'] -OutputEncoding $job['OutputEncoding']
         } catch {
             $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = [string]$_; Aborted = $false; TimedOut = $false })
             throw
@@ -1321,7 +1354,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'ConvertTo-PkArgumentString')
