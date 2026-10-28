@@ -20,6 +20,7 @@ Built with Claude Code.
 Most uses are this: a list of command-line programs, run a few at a time, where Ctrl+C lets the running ones finish instead of cutting them off.
 
 ```powershell
+# In a saved script. At the prompt, $PSScriptRoot is empty: use . .\ParallelKit.ps1 instead.
 . "$PSScriptRoot\ParallelKit.ps1"
 
 $commands = foreach ($f in Get-ChildItem *.png) {
@@ -28,6 +29,7 @@ $commands = foreach ($f in Get-ChildItem *.png) {
 $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
 
 foreach ($r in $batch.Results) {
+    if ($r.Aborted) { continue }   # stopped by Ctrl+C before it finished; no exit code
     if ($r.ExitCode -ne 0) { Write-Warning ('Failed: ' + $r.Command.Arguments) }
 }
 ```
@@ -132,9 +134,11 @@ Each command is a hashtable with `FilePath`, `Arguments` and optionally `Working
 
 `-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted.
 
+Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
+
 `-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it.
 
-`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces.
+`Invoke-PkRun { ... }` is what makes Ctrl+C graceful. Whatever the block outputs is passed through, so `$batch` above gets the batch result. It also stops the PC idle-sleeping until the run ends (`-KeepAwake $false` to opt out); the display can still turn off. Without `Invoke-PkRun` the engines still work, but Ctrl+C kills the script the normal way. See "Abort" below for what it means for your own code inside the braces. The block runs inside `Invoke-PkRun`, so a variable of yours named like one of its own (`$ScriptBlock`, `$KeepAwake`, `$DisableQuickEdit`) reads its value instead; add `.GetNewClosure()` to the block if that could happen.
 
 ## Run PowerShell code in parallel
 
@@ -174,6 +178,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
 - `-JobCrashedHandler { param($err) ... }` is told when a worker throws. That job's result handler isn't called.
+- `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
 - Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
 
@@ -260,19 +265,20 @@ The handler always runs on the main thread, so it can use anything. The kit's ow
 
 ## Abort
 
-Inside `Invoke-PkRun { ... }`, Ctrl+C or closing the window:
+Inside `Invoke-PkRun { ... }`, Ctrl+C:
 
 1. stops new jobs from starting,
 2. cancels the run's token (`Test-PkCancelRequested` turns true in workers),
 3. waits for in-flight work (`-DrainTimeoutSeconds` / `-AbortTimeoutSeconds`, default 60),
 4. force-stops whatever is left, calling `-JobAbortCleanup` for each killed or never-started process job.
 
-A window close gets no waiting period: Windows allows only a few seconds, so leftovers are stopped straight away.
+Closing the window does the same minus step 3: Windows allows only a few seconds, so leftovers are stopped straight away.
 
-Two things to know:
+Three things to know:
 
 - **Inside `Invoke-PkRun`, Ctrl+C no longer kills anything by itself.** It only raises a flag. The kit's engines watch that flag. A long step of your own in there has to check `Test-PkAbortSignal` now and then and stop when it's true, or Ctrl+C will seem to do nothing until that step ends.
 - **An abort stays in force until it's reset.** `Invoke-PkRun` resets it at the start of each run. If you call an engine again outside `Invoke-PkRun` after an abort, it returns straight away with `Aborted = $true`. Call `Reset-PkAbortState` first if you mean to carry on.
+- **Your script carries on after an abort.** The engines return with `Aborted = $true` and the rest of your script runs. If an abort should end it, say so: `if ($batch.Aborted) { exit 1 }`.
 
 `Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
 
@@ -345,9 +351,25 @@ Yes. `-OnComplete` (batch) and `-PollCallback` (runspace jobs) run on the main t
 
 Start from the CPU core count and measure. [Choosing limits](#choosing-limits) has more.
 
+**Can I pipe into it?**
+
+No. The engines take a list of hashtables (`-Commands`, `-JobParams`) rather than pipeline input, because each job needs several named values and the kit wants the whole list (or a provider for it) before it starts. Build the list with `foreach`, as the examples do: `$commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = ...; Arguments = ... } }`.
+
+**Which functions are meant to be used?**
+
+The ones in this README: the engines, the [single-process functions](#single-processes), and the abort and message functions named in their sections. Dot-sourcing also brings in internal helpers (`Invoke-PkProcessDispatchCore`, `Get-PkCommandKind` and so on), which show up in tab completion. Those can change between versions; don't call them.
+
+**Does a program I start get my Ctrl+C too?**
+
+No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one, the kit kills it.
+
 **Was this written by AI?**
 
 It was built with Claude Code, as the top of this page says. The worker rules and abort behaviour come from hangs and bugs reproduced in real runs of the original project, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
+
+## Bugs and questions
+
+Open an [issue](https://github.com/HalRiveria/PowerShell-ParallelKit/issues) with what you ran, what happened, and your Windows and PowerShell versions (`$PSVersionTable`).
 
 ## License
 
