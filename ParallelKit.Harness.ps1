@@ -664,9 +664,52 @@ $f = Test-PkWorkerSafety -WorkerScript { param($Id) $add = { param($k, $old) $ol
 Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a variable holding a .GetNewClosure() block, passed to a .NET method, is flagged"
 $f = Test-PkWorkerSafety -WorkerScript { param($Id) $sb = { $_ * 2 }; $n = 'x'; $x = @(1, 2).ForEach($sb); $null = $n.Contains($n) }
 Test-Assert ($f.Count -eq 0) "a scriptblock variable given to .ForEach(), and other variables given to .NET methods, are not flagged"
-$f = Test-PkWorkerSafety -WorkerScript { param($Id) $list = [System.Collections.Generic.List[scriptblock]]::new(); $list.Add({ 1 })  # pk:ignore
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [System.Threading.Tasks.Task]::Run({ 1 })  # pk:ignore
 }
-Test-Assert ($f.Count -eq 0) "'# pk:ignore' accepts a method that really does take a scriptblock"
+Test-Assert ($f.Count -eq 0) "'# pk:ignore' accepts a finding on its line"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $h = { 1 }; $m = [System.Collections.Generic.Dictionary[string,scriptblock]]::new(); $m.Add('a', $h); $l = [System.Collections.Generic.List[scriptblock]]::new(); $l.Add({ 2 }); $q = [System.Collections.Generic.Queue[scriptblock]]::new(); $q.Enqueue($h) }
+Test-Assert ($f.Count -eq 0) ("storing a scriptblock in a collection (.Add/.Enqueue) is not flagged (got " + $f.Count + ")")
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) $h = { 1 }; $d = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new(); $null = $d.GetOrAdd('a', $h) }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'DelegateCast') "a scriptblock variable passed as a GetOrAdd factory is still flagged"
+
+# MissingFunction through an alias, and for a module a worker can't load.
+Set-Alias -Name hdbl -Value Get-HarnessDouble -Scope Global
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) hdbl -Value $Id }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'MissingFunction') "an alias to an unshared function of yours is flagged"
+Remove-Item -LiteralPath Alias:\hdbl
+$modName = "pk-temp-" + [guid]::NewGuid().ToString("N")
+$modPath = Join-Path $env:TEMP ($modName + ".psm1")
+[System.IO.File]::WriteAllText($modPath, 'function Get-PkTempModuleThing { 1 }')
+Import-Module -Name $modPath -Global
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) Get-PkTempModuleThing }
+Test-Assert ($f.Count -eq 1 -and $f[0].Rule -eq 'MissingFunction' -and $f[0].Text -like '*PSModulePath*') "a function from a module imported by path is flagged"
+$f = Test-PkWorkerSafety -WorkerScript { param($Id) Get-PkTempModuleThing } -SharedFunctionNames @('Get-PkTempModuleThing')
+Test-Assert ($f.Count -eq 0) "and listing it in -SharedFunctionNames clears it"
+Remove-Module -Name $modName
+[System.IO.File]::Delete($modPath)
+
+# Job-value scan: nested values, typed arrays, and live shared collections.
+$mainThreadBlock = { 1 }
+Test-Assert ((Get-PkScriptBlockJobKey -Job @{ Steps = @(@{ Name = 'a'; Run = $mainThreadBlock }) }) -eq 'Steps') "a scriptblock two levels down in a job value is found"
+Test-Assert ((Get-PkScriptBlockJobKey -Job @{ Opts = [pscustomobject]@{ OnDone = $mainThreadBlock } }) -eq 'Opts') "a scriptblock in a [pscustomobject] property is found"
+$bigBytes = [byte[]]::new(20MB)
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$key = Get-PkScriptBlockJobKey -Job @{ Data = $bigBytes; Paths = [string[]]::new(200000) }
+$sw.Stop()
+Test-Assert ($null -eq $key -and $sw.Elapsed.TotalSeconds -lt 1) ("a 20 MB byte[] and a 200k string[] are skipped, not walked (" + [int]$sw.Elapsed.TotalMilliseconds + "ms)")
+$sink = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+for ($i = 0; $i -lt 20000; $i++) { $null = $sink.Add([pscustomobject]@{ N = $i }) }
+$writer = [PowerShell]::Create()
+$null = $writer.AddScript('param($s) while ($true) { $null = $s.Add(1); $s.RemoveAt(0) }').AddArgument($sink)
+$writerHandle = $writer.BeginInvoke()
+$scanError = $null
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt 3 -and $null -eq $scanError) {
+    try { $null = Get-PkScriptBlockJobKey -Job @{ Sink = $sink } } catch { $scanError = $_ }
+}
+$null = $writer.BeginStop($null, $null)
+$writer.Dispose()
+Test-Assert ($null -eq $scanError) ("scanning a collection other threads are changing doesn't throw (" + $scanError + ")")
 
 # With no Initialize-ParallelKit at all, starting a process sets up the
 # thread pool and the kill-on-close job object. Needs a fresh process.

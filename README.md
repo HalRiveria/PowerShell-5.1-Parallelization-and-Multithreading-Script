@@ -166,7 +166,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Each job hashtable's keys become the worker's parameters. The worker's `param()` block must declare every key. A key it doesn't declare is an error; with a fixed `-JobParams` list it's caught before any worker starts.
 - If the worker declares a `$CancelToken` parameter, it gets the run's cancellation token.
 - `-JobParams` takes a list or array of job hashtables. A single hashtable works too, so a list that happens to hold one job is fine.
-- A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there.
+- A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there, and cmdlets and functions from installed modules load on their own. A module you imported by path isn't installed, so list its functions too (or put it on `$env:PSModulePath`).
 - Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
@@ -185,7 +185,7 @@ Worker code is the worker script, every function in `-SharedFunctionNames`, and 
 
 Everything else is fine in a worker, cmdlets included. Callbacks that run on the main thread (`-ResultHandler`, `-PollCallback`, `-NextJobProvider`, `-OnComplete`, the message handler) are not worker code and can use anything.
 
-`Invoke-PkRunspaceJobs` checks both rules before it starts anything, and refuses to launch code that breaks them, naming the line or the job key. Pass `-CheckWorkerSafety:$false` to turn that off. The code check is also available on its own as `Test-PkWorkerSafety -WorkerScript $w -SharedFunctionNames $names`, which returns a list of findings (including functions the worker calls but you didn't share), for use in your own tests. For rule 2 it flags written casts, and scriptblocks passed into a .NET method or constructor, either written in the call or through a variable they were assigned to. `# pk:ignore` on a line accepts a finding. It can't see commands run through a variable (`& $cmd`), or a scriptblock buried more than one level deep in a job value.
+`Invoke-PkRunspaceJobs` checks both rules before it starts anything, and refuses to launch code that breaks them, naming the line or the job key. Pass `-CheckWorkerSafety:$false` to turn that off. The code check is also available on its own as `Test-PkWorkerSafety -WorkerScript $w -SharedFunctionNames $names`, which returns a list of findings (including functions the worker calls but you didn't share), for use in your own tests. For rule 2 it flags written casts, and scriptblocks passed into a .NET method or constructor, either written in the call or through a variable they were assigned to. `# pk:ignore` on a line accepts a finding. Storing a scriptblock in a collection (`$list.Add($sb)`, `$queue.Enqueue($sb)`) isn't flagged, since that makes no delegate. It can't see commands run through a variable (`& $cmd`), a collection typed to hold delegates (`List[Func[object]]`, whose `.Add` converts), or a scriptblock buried more than three levels deep in a job value.
 
 ### Why these rules exist
 
