@@ -559,6 +559,32 @@ function Start-PkProcess {
     }
 }
 
+function Stop-PkProcessTree {
+    # Kills a process and every process it started (taskkill /T /F), so
+    # none of them is left holding its output open. Falls back to killing
+    # just the process. Returns $true if this call killed it, $false if it
+    # had already exited on its own.
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    if ($Process.HasExited) { return $false }
+    $killed = $false
+    $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F /PID ' + $Process.Id))
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    try {
+        $taskkill = [System.Diagnostics.Process]::Start($psi)
+        try {
+            if ($taskkill.WaitForExit(10000)) { $killed = ($taskkill.ExitCode -eq 0) }
+        } finally { $taskkill.Dispose() }
+    } catch { }  # taskkill missing or blocked: the fallback below still kills the process itself
+    if (-not $killed -and -not $Process.HasExited) {
+        try { $Process.Kill(); $killed = $true } catch { }  # it exited between the check and the kill
+    }
+    if ($killed) { $null = $Process.WaitForExit(5000) }
+    return $killed
+}
+
 function Wait-PkProcess {
     # Waits on the raw process handle. Returns $true if it exited in time.
     # (Process.WaitForExit(int) also waits on the redirected streams and can
@@ -1225,8 +1251,9 @@ function Invoke-PkProcessBatch {
         $dispatchParams['JobPollCompleted'] = {
             param($job)
             if (-not $job['Proc'].HasExited -and $job['Stopwatch'].Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-                $job['TimedOut'] = $true
-                try { $job['Proc'].Kill() } catch { }  # it may have exited between the check and the kill
+                # Only flagged if this call did the killing: a program that
+                # exited on its own right at the deadline didn't time out.
+                if (Stop-PkProcessTree -Process $job['Proc']) { $job['TimedOut'] = $true }
             }
             return $job['Proc'].HasExited
         }.GetNewClosure()
@@ -1242,7 +1269,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource')

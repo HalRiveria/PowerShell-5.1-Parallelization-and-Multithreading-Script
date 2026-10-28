@@ -1078,6 +1078,17 @@ $fast = @($batch.Results | Where-Object { $_.Command['Name'] -eq 'fast' })
 Test-Assert ($slow.Count -eq 1 -and $slow[0].TimedOut -and $slow[0].ExitCode -ne 0 -and $sw.Elapsed.TotalSeconds -lt 15) ("batch: -TimeoutSeconds kills an overrunning program and marks it TimedOut (" + [int]$sw.Elapsed.TotalSeconds + "s)")
 Test-Assert ($fast.Count -eq 1 -and -not $fast[0].TimedOut -and $fast[0].ExitCode -eq 0 -and -not $batch.Aborted) "and the others finish normally, not TimedOut"
 Test-Assert ($completed.Count -eq 2) "a timed-out program still goes through -OnComplete"
+# A program whose own child holds the output open: the whole tree is killed,
+# so the output closes at once instead of after the 15-second stream wait.
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$batch = Invoke-PkProcessBatch -MaxConcurrent 1 -TimeoutSeconds 2 -Commands @(@{ FilePath = $cmdExe; Arguments = ('/c ""' + $pingExe + '" -n 30 127.0.0.1"') })
+$sw.Stop()
+$r = @($batch.Results)[0]
+Test-Assert ($r.TimedOut -and -not $r.StreamTimedOut -and $sw.Elapsed.TotalSeconds -lt 10) ("batch: a timeout kills the program's children too (" + [int]$sw.Elapsed.TotalSeconds + "s, StreamTimedOut=" + $r.StreamTimedOut + ")")
+$j = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
+$null = Wait-PkProcess -Process $j.Proc -TimeoutMs 5000
+Test-Assert (-not (Stop-PkProcessTree -Process $j.Proc)) "Stop-PkProcessTree reports `$false for a program that already exited"
+$j.Proc.Dispose()
 $threw = $false
 try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -TimeoutSeconds -1 } catch { $threw = ($_.ToString() -like '*-TimeoutSeconds*') }
 Test-Assert $threw "a negative -TimeoutSeconds is refused"
