@@ -1960,3 +1960,18 @@ function Test-PkWorkerSafety {
 
     return ,$findings
 }
+
+# ==============================================================================
+#  Make the kit's functions global
+# ==============================================================================
+
+# Dot-sourced inside a script run from a prompt (.\script.ps1 or & script),
+# the functions above exist only in that script's scope. A .GetNewClosure()
+# block - the batch's own callbacks, or yours - can only see global
+# functions, so it couldn't find them. Defining each one globally too means
+# kit functions work from any closure, however the script was started.
+foreach ($pkFunction in $MyInvocation.MyCommand.ScriptBlock.Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+    $pkLocal = Get-Item -LiteralPath ("Function:\" + $pkFunction.Name)
+    $null = Set-Item -Path ("Function:\global:" + $pkFunction.Name) -Value $pkLocal.ScriptBlock
+}
+Remove-Variable -Name pkFunction, pkLocal -ErrorAction SilentlyContinue

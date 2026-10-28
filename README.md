@@ -93,7 +93,7 @@ If you downloaded the file, Windows marks it as coming from the internet and you
 
 It works whether or not your script uses `Set-StrictMode`.
 
-Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
+Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`. Its functions are also defined globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started.
 
 `Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
@@ -236,7 +236,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
 - Returns an object with `GroupResults`, `Aborted`, `ForceKilledCount` and `JobStarterFailedCount`. `GroupResults` holds one object with `GroupInfo`, `Completed` and `Aborted` per group, where `GroupInfo` is the group value.
 
-Closures: build every callback that uses your local variables with `{ ... }.GetNewClosure()`. Without it, a variable name that happens to match one inside the kit silently reads the kit's value instead of yours. And keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a closure doesn't stick between calls.
+Closures: build every callback that uses your local variables with `{ ... }.GetNewClosure()`. Without it, a variable name that happens to match one inside the kit silently reads the kit's value instead of yours. And keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a closure doesn't stick between calls. A closure can't see functions your script defines when the script is run from a prompt (`.\script.ps1`); the kit's own functions always work, but define any of yours that a closure calls as `function global:Get-Thing { ... }`.
 
 ## Single processes
 
