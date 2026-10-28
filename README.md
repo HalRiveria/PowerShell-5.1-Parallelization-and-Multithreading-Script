@@ -363,7 +363,7 @@ The ones in this README: the engines, the [single-process functions](#single-pro
 
 **Does a program I start get my Ctrl+C too?**
 
-No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one, the kit kills it.
+No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one (a timeout, or an abort's force-stop), the kit kills it along with anything it started.
 
 **Was this written by AI?**
 

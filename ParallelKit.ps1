@@ -748,7 +748,7 @@ function Invoke-PkProcessWithTimeout {
             if (-not $exited -and -not $IgnoreAbort -and ((Test-PkAbortSignal) -or (Test-PkCancelRequested))) { $stopWhy = "was stopped because the run is being aborted"; break }
         }
         if (-not $exited) {
-            try { $job['Proc'].Kill() } catch { }   # already-exited race - the throw below still reports why
+            try { $null = Stop-PkProcessTree -Process $job['Proc'] } catch { }   # best effort - the throw below still reports why
             # Let the two output reads finish (the kill closes their pipes)
             # before the process is disposed under them. Bounded, and any
             # read error is irrelevant - the stop reason is what gets reported.
@@ -1079,7 +1079,7 @@ function Invoke-PkProcessDispatchCore {
     } catch {
         # Best-effort teardown on the way out; the original error is rethrown.
         foreach ($job in $running) {
-            try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
+            try { if ($job['Proc']) { $null = Stop-PkProcessTree -Process $job['Proc'] } } catch { }  # a custom starter's .Proc may not be a Process
             try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
             if (-not $job['SlotReleased']) {
                 try { $null = & $JobAbortCleanup $job } catch { }
@@ -1199,7 +1199,7 @@ function Invoke-PkProcessDispatchCore {
                 $dispatchResult.ForceKilledCount = $running.Count
                 Write-PkMessage ("ProcessDispatch: force-stopping " + $running.Count + " job(s) that did not finish within " + $AbortTimeoutSeconds + "s.") -Level Warn
                 foreach ($job in $running) {
-                    try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
+                    try { if ($job['Proc']) { $null = Stop-PkProcessTree -Process $job['Proc'] } } catch { }  # a custom starter's .Proc may not be a Process
                     try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
                     try { $null = & $JobAbortCleanup $job } catch { }
                     try { if ($job['Proc']) { $job['Proc'].Dispose() } } catch { }
@@ -1209,7 +1209,7 @@ function Invoke-PkProcessDispatchCore {
             }
         } catch {
             foreach ($job in $running) {
-                try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
+                try { if ($job['Proc']) { $null = Stop-PkProcessTree -Process $job['Proc'] } } catch { }  # a custom starter's .Proc may not be a Process
                 try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
                 if (-not $job['SlotReleased']) {
                     try { $null = & $JobAbortCleanup $job } catch { }

@@ -1233,6 +1233,25 @@ $j = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
 $null = Wait-PkProcess -Process $j.Proc -TimeoutMs 5000
 Test-Assert (-not (Stop-PkProcessTree -Process $j.Proc)) "Stop-PkProcessTree reports `$false for a program that already exited"
 $j.Proc.Dispose()
+
+# Every other place the kit kills a program kills its children too: a
+# Invoke-PkProcessWithTimeout overrun, and the dispatcher's force-stop
+# after an abort. Each test's ping has its own count, so a surviving one
+# can be found by its command line.
+function Get-HarnessPingCount([int]$Count) {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $Count + " 127.0.0.1*") }).Count
+}
+$nestedPing = { param($n) '/c ""' + $pingExe + '" -n ' + $n + ' 127.0.0.1"' }
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments (& $nestedPing 41) -TimeoutMs 1500 } catch { }  # the overrun throw is expected
+Test-Assert ((Get-HarnessPingCount 41) -eq 0) "Invoke-PkProcessWithTimeout: an overrun kills the program's children too"
+Reset-Harness
+$abortTimer = [PowerShell]::Create()
+$null = $abortTimer.AddScript({ [System.Threading.Thread]::Sleep(1500); [PkConsoleCtrl]::AbortRequested = $true })
+$abortTimerHandle = $abortTimer.BeginInvoke()
+$batch = Invoke-PkProcessBatch -AbortTimeoutSeconds 1 -Commands @(@{ FilePath = $cmdExe; Arguments = (& $nestedPing 43) })
+$null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
+Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 1 -and (Get-HarnessPingCount 43) -eq 0) ("dispatch: the force-stop after an abort kills the program's children too (aborted=" + $batch.Aborted + ", force-killed=" + $batch.ForceKilledCount + ")")
+Reset-PkAbortState
 $threw = $false
 try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -TimeoutSeconds -1 } catch { $threw = ($_.ToString() -like '*-TimeoutSeconds*') }
 Test-Assert $threw "a negative -TimeoutSeconds is refused"
