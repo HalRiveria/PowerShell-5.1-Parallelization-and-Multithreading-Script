@@ -999,6 +999,15 @@ Test-Assert ($threw -and $sw.Elapsed.TotalSeconds -lt 6) ("Invoke-PkProcessWithT
 Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Ctrl+C detected*' }).Count -eq 1) "and the abort is announced"
 $null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
 
+# A window close gets no drain, so its announcement mustn't say it waits.
+Reset-Harness
+[PkConsoleCtrl]::IsCloseEvent = $true
+[PkConsoleCtrl]::AbortRequested = $true
+$null = Test-PkAbortSignal
+$closeMessage = @($script:messages | Where-Object { $_.Message -like '*Window close detected*' })
+Test-Assert ($closeMessage.Count -eq 1 -and $closeMessage[0].Message -notlike '*please wait*' -and $closeMessage[0].Message -like '*stopping*') ("a window close is announced as stopping jobs, not waiting for them (" + (@($closeMessage | ForEach-Object { $_.Message }) -join ' | ') + ")")
+Reset-PkAbortState
+
 # The same from inside a worker, where the run's cancel is what it sees.
 Reset-Harness
 $poll = @{ Count = 0 }

@@ -448,7 +448,8 @@ function Test-PkAbortSignal {
         $abortMessage = if (-not [PkState]::CloseAbort) {
             "[ABORT] Ctrl+C detected - finishing current jobs, please wait..."
         } else {
-            "[ABORT] Window close detected - finishing current jobs, please wait..."
+            # No drain on a close: Windows ends the process within seconds.
+            "[ABORT] Window close detected - stopping current jobs now..."
         }
         Invoke-PkMessageHandler -Message $abortMessage -Level Warn
     }
