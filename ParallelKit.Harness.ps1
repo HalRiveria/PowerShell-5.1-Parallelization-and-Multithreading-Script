@@ -332,7 +332,7 @@ $sw.Stop()
 Test-Assert ($dispatch.Aborted) "an abort mid-dispatch is reported as Aborted"
 Test-Assert ($dispatch.ForceKilledCount -eq 2) "the 2 running processes are force-killed after the abort timeout"
 Test-Assert ($cleaned.Count -eq 5) ("-JobAbortCleanup runs for killed AND never-started jobs (got " + $cleaned.Count + ")")
-Test-Assert ($dispatch -is [hashtable]) "the dispatcher returns exactly one result object, even on the force-kill path"
+Test-Assert ($dispatch -is [System.Management.Automation.PSCustomObject]) "the dispatcher returns exactly one result object, even on the force-kill path"
 Test-Assert ($dispatch.GroupResults.Count -eq 1 -and $dispatch.GroupResults[0].Aborted) "the unfinished group is reported as aborted"
 Test-Assert ($sw.Elapsed.TotalSeconds -lt 15) ("the dispatcher returns promptly (" + [int]$sw.Elapsed.TotalSeconds + "s), not after 30s of ping")
 Write-Host ""
@@ -501,11 +501,11 @@ $out = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(1..4
     -WorkerScript { param([int]$Id) for ($i = 0; $i -lt 50; $i++) { if (Test-PkCancelRequested) { return $Id }; [System.Threading.Thread]::Sleep(100) }; return $Id } `
     -ResultHandler { param($r) $true; 123 } `
     -PollCallback { $poll.Count++; if ($poll.Count -eq 4) { Request-PkAbort }; "noise" }.GetNewClosure()
-Test-Assert ($out -is [hashtable] -and $out.Aborted) "runspace jobs: noisy -ResultHandler/-PollCallback don't corrupt the result, even through an abort drain"
+Test-Assert ($out -is [System.Management.Automation.PSCustomObject] -and $out.Aborted) "runspace jobs: noisy -ResultHandler/-PollCallback don't corrupt the result, even through an abort drain"
 
 Reset-Harness
 $crashOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param($Id) throw "x" } -JobCrashedHandler { param($e) "noise"; 5 }
-Test-Assert ($crashOut -is [hashtable] -and $crashOut.CrashedCount -eq 1) "runspace jobs: a noisy -JobCrashedHandler doesn't corrupt the result"
+Test-Assert ($crashOut -is [System.Management.Automation.PSCustomObject] -and $crashOut.CrashedCount -eq 1) "runspace jobs: a noisy -JobCrashedHandler doesn't corrupt the result"
 
 Reset-Harness
 $feed = @{ Given = $false }; $ticks = @{ Count = 0 }
@@ -516,11 +516,11 @@ $noisy = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 `
     -JobAbortCleanup { param($job) "noise"; $true } `
     -GroupCompleteCallback { param($group) "noise"; 1 } `
     -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort }; "noise" }.GetNewClosure()
-Test-Assert ($noisy -is [hashtable] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-AbortPollCallback don't corrupt the result"
+Test-Assert ($noisy -is [System.Management.Automation.PSCustomObject] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-AbortPollCallback don't corrupt the result"
 
 Reset-Harness
 $noisyBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -MaxConcurrent 1 -OnComplete { param($c, $r) "noise"; $true }
-Test-Assert ($noisyBatch -is [hashtable] -and $noisyBatch.Results.Count -eq 1) "batch: a noisy -OnComplete doesn't corrupt the result"
+Test-Assert ($noisyBatch -is [System.Management.Automation.PSCustomObject] -and $noisyBatch.Results.Count -eq 1) "batch: a noisy -OnComplete doesn't corrupt the result"
 
 Set-PkMessageHandler -Handler { param($Message, $Level) "noise"; 42 }
 $leaked = Write-PkMessage "hello"
@@ -1132,18 +1132,35 @@ Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
 # Every batch result has every documented field, so a strict-mode caller
 # can read any of them without a "property cannot be found" error.
 Reset-Harness
+# Results are objects with their fields in a fixed order, so Format-Table
+# shows them readably.
+function Get-HarnessShape($o) { if ($o -isnot [System.Management.Automation.PSCustomObject]) { return '(not an object)' }; return ($o.PSObject.Properties.Name -join ',') }
+$shapeBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' })
+Test-Assert ((Get-HarnessShape $shapeBatch) -eq 'Results,Aborted,ForceKilledCount') ("a batch returns an object (" + (Get-HarnessShape $shapeBatch) + ")")
+Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
+$shapeOne = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0'
+Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
+$shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
+Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
+$shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
+Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
+$shapeFindings = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [Func[int]]{ 1 } }
+$shapeFinding = $shapeFindings[0]
+Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")
+Test-Assert ((Get-HarnessShape (Initialize-ParallelKit)) -eq 'AbortHandler,ChildProcessJob,ThreadPool') "Initialize-ParallelKit returns an object"
+
 $fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut')
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
     @{ FilePath = $cmdExe; Arguments = '/c exit 0' },
     @{ FilePath = 'C:\definitely\not\here.exe' })
-$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if ($r.PSObject.Properties.Name -notcontains $k) { $k } } }
 Test-Assert ($batch.Results.Count -eq 2 -and @($missing).Count -eq 0) ("batch results for a finished and an unstartable command carry every field (missing: " + (@($missing) -join ', ') + ")")
 
 # An abort already in force: nothing starts, every command comes back Aborted.
 Reset-Harness
 Request-PkAbort
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' })
-$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if ($r.PSObject.Properties.Name -notcontains $k) { $k } } }
 Test-Assert ($batch.Aborted -and $batch.Results.Count -eq 2 -and @($batch.Results | Where-Object { $_.Aborted }).Count -eq 2) "batch: commands an abort kept from starting come back marked Aborted"
 Test-Assert (@($missing).Count -eq 0) ("and their results carry every field too (missing: " + (@($missing) -join ', ') + ")")
 Reset-PkAbortState

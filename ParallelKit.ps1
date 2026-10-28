@@ -385,7 +385,7 @@ function Initialize-ParallelKit {
     $handlerOk = Register-PkAbortHandler
     $jobOk     = Initialize-PkChildProcessJob
     $poolOk    = Initialize-PkThreadPool -MaxConcurrentProcesses $MaxConcurrentProcesses
-    return @{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk }
+    return [pscustomobject][ordered]@{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk }
 }
 
 function Set-PkRunActive {
@@ -659,8 +659,8 @@ function Wait-PkProcess {
 }
 
 function Complete-PkProcess {
-    # Call once the process has exited. Returns
-    # @{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError }. A process that exited
+    # Call once the process has exited. Returns an object with
+    # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError. A process that exited
     # can still have an open pipe (a grandchild inherited it), so the stream
     # read is bounded too.
     param(
@@ -669,7 +669,7 @@ function Complete-PkProcess {
         [int]$StreamTimeoutMs = 15000,
         [bool]$Dispose = $false
     )
-    $result = @{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
+    $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
     # A job started by a custom starter may have no read tasks, and a read
     # can fail. Neither is worth an exception here - this runs inside
     # JobFinalize, where a throw stops the whole dispatcher.
@@ -688,12 +688,12 @@ function Complete-PkProcess {
     if ($null -ne $Job['StderrTask'] -and $Job['StderrTask'].Status -eq $ranToCompletion) { $result.Stderr = $Job['StderrTask'].Result }
     $result.ExitCode = $Job['Proc'].ExitCode
     if ($Dispose) { $Job['Proc'].Dispose() }
-    return $result
+    return [pscustomobject]$result
 }
 
 function Invoke-PkProcessWithTimeout {
     # Run one process to completion, synchronously, with a hard time limit.
-    # Returns @{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError };
+    # Returns Complete-PkProcess's object (ExitCode, Stdout, Stderr, StreamTimedOut, StreamError);
     # throws if the process had to be killed - because it overran, or
     # because the run was aborted/cancelled while it was going.
     param(
@@ -763,7 +763,8 @@ function Invoke-PkProcessDispatch {
     # has a Group field of its own.
     # $MaxConcurrent is an int, or a SemaphoreSlim shared between several
     # dispatchers that must stay under one combined limit.
-    # Returns @{ GroupResults; Aborted; ForceKilledCount; JobStarterFailedCount }.
+    # Returns an object with GroupResults, Aborted, ForceKilledCount, JobStarterFailedCount;
+    # each group result has GroupInfo, Completed, Aborted.
     # Anything your callbacks output is discarded, except where a return value is listed above.
     param(
         [Parameter(Mandatory)]
@@ -878,7 +879,7 @@ function Invoke-PkProcessDispatchCore {
     $isSharedBudget = ($MaxConcurrent -is [System.Threading.SemaphoreSlim])
 
     $groupStates      = [System.Collections.Generic.Dictionary[object,hashtable]]::new()
-    $groupResults     = [System.Collections.Generic.List[hashtable]]::new()
+    $groupResults     = [System.Collections.Generic.List[object]]::new()
     $activeGroupCount = 0
     $providerExhausted = $false
     $heldGroups       = [System.Collections.Generic.List[object]]::new()
@@ -886,7 +887,7 @@ function Invoke-PkProcessDispatchCore {
     $pending = [System.Collections.Generic.Queue[hashtable]]::new()
     $running = [System.Collections.Generic.List[hashtable]]::new()
 
-    $dispatchResult = @{
+    $dispatchResult = [ordered]@{
         GroupResults          = $groupResults
         Aborted               = $false
         ForceKilledCount      = 0
@@ -936,7 +937,7 @@ function Invoke-PkProcessDispatchCore {
                 $null = & $GroupCompleteCallback $groupInfo
                 $state.Completed = $true
                 if ($null -ne $GroupReleaseCheck) { $heldGroups.Add($groupInfo) } else { $activeGroupCount-- }
-                $groupResults.Add(@{ GroupInfo = $groupInfo; Completed = $true; Aborted = $false })
+                $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $groupInfo; Completed = $true; Aborted = $false })
             }
         }
 
@@ -990,7 +991,7 @@ function Invoke-PkProcessDispatchCore {
                         $null = & $GroupCompleteCallback $state.GroupInfo
                         $state.Completed = $true
                         $activeGroupCount--
-                        $groupResults.Add(@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
+                        $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
                     }
                 } else {
                     Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (JobStarter failure path). This should be unreachable; the dispatch loop may now hang.") -Level Error
@@ -1034,7 +1035,7 @@ function Invoke-PkProcessDispatchCore {
                             $null = & $GroupCompleteCallback $state.GroupInfo
                             $state.Completed = $true
                             $activeGroupCount--
-                            $groupResults.Add(@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
+                            $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
                         }
                     } else {
                         Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (main poll pass). This should be unreachable; the dispatch loop may now hang.") -Level Error
@@ -1101,7 +1102,7 @@ function Invoke-PkProcessDispatchCore {
                                     $null = & $GroupCompleteCallback $state.GroupInfo
                                     $state.Completed = $true
                                     $activeGroupCount--
-                                    $groupResults.Add(@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
+                                    $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
                                 }
                             } else {
                                 Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (graceful-wait loop). This should be unreachable.") -Level Error
@@ -1154,7 +1155,7 @@ function Invoke-PkProcessDispatchCore {
                                     $null = & $GroupCompleteCallback $state.GroupInfo
                                     $state.Completed = $true
                                     $activeGroupCount--
-                                    $groupResults.Add(@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
+                                    $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $state.GroupInfo; Completed = $true; Aborted = $false })
                                 }
                             } else {
                                 Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (final pass). This should be unreachable.") -Level Error
@@ -1214,11 +1215,32 @@ function Invoke-PkProcessDispatchCore {
             # every other group its result.
             try { $null = & $GroupCompleteCallback $state.GroupInfo } catch { }
             $state.Completed = $true
-            $groupResults.Add(@{ GroupInfo = $state.GroupInfo; Completed = $false; Aborted = $true })
+            $groupResults.Add([pscustomobject][ordered]@{ GroupInfo = $state.GroupInfo; Completed = $false; Aborted = $true })
         }
     }
 
-    return $dispatchResult
+    return [pscustomobject]$dispatchResult
+}
+
+function New-PkBatchResult {
+    # One Invoke-PkProcessBatch result, the same shape however the command
+    # ended: ran (-Completed is Complete-PkProcess's object), couldn't start
+    # (-StartError), or stopped by an abort (-Aborted).
+    param(
+        [hashtable]$Command,
+        $Completed = $null,
+        [string]$StartError = $null,
+        [switch]$Aborted,
+        [bool]$TimedOut = $false
+    )
+    $r = [ordered]@{ Command = $Command; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null
+                     StartError = $null; Aborted = [bool]$Aborted; TimedOut = $TimedOut }
+    if ($null -ne $Completed) {
+        $r.ExitCode = $Completed.ExitCode; $r.Stdout = $Completed.Stdout; $r.Stderr = $Completed.Stderr
+        $r.StreamTimedOut = $Completed.StreamTimedOut; $r.StreamError = $Completed.StreamError
+    }
+    if ($StartError) { $r.StartError = $StartError }
+    return [pscustomobject]$r
 }
 
 function Invoke-PkProcessBatch {
@@ -1228,9 +1250,10 @@ function Invoke-PkProcessBatch {
     # (not for one that couldn't start or was stopped by an abort).
     # $TimeoutSeconds > 0 kills a program still running after that long; its
     # result has TimedOut = $true (0 = no limit).
-    # Returns @{ Results; Aborted; ForceKilledCount }; each result is
-    # @{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted; TimedOut },
-    # every field always present - keep the three places that build one in sync.
+    # Returns an object with Results, Aborted, ForceKilledCount; each result
+    # is an object with Command, ExitCode, Stdout, Stderr, StreamTimedOut,
+    # StreamError, StartError, Aborted, TimedOut - every field always present,
+    # since all three places that build one go through New-PkBatchResult.
     # $Commands may be $null: a foreach that matches nothing yields $null, not
     # an empty array, and an empty batch should just return no results.
     param(
@@ -1246,7 +1269,7 @@ function Invoke-PkProcessBatch {
 
     if ($TimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
-    $results = [System.Collections.Generic.List[hashtable]]::new()
+    $results = [System.Collections.Generic.List[object]]::new()
     $state   = @{ Given = $false }
 
     $groupProvider = {
@@ -1270,7 +1293,7 @@ function Invoke-PkProcessBatch {
         try {
             $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory']
         } catch {
-            $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = [string]$_; Aborted = $false; TimedOut = $false })
+            $results.Add((New-PkBatchResult -Command $job['Command'] -StartError ([string]$_)))
             throw
         }
         $job['Proc'] = $started.Proc; $job['StdoutTask'] = $started.StdoutTask; $job['StderrTask'] = $started.StderrTask
@@ -1280,8 +1303,7 @@ function Invoke-PkProcessBatch {
 
     $jobFinalize = {
         param($job, $pendingQueue)
-        $r = Complete-PkProcess -Job $job
-        $r.Command = $job['Command']; $r.StartError = $null; $r.Aborted = $false; $r.TimedOut = [bool]$job['TimedOut']
+        $r = New-PkBatchResult -Command $job['Command'] -Completed (Complete-PkProcess -Job $job) -TimedOut ([bool]$job['TimedOut'])
         $results.Add($r)
         if ($null -ne $OnComplete) { $null = & $OnComplete $job['Command'] $r }
         return @{ Success = ($r.ExitCode -eq 0) }
@@ -1289,7 +1311,7 @@ function Invoke-PkProcessBatch {
 
     $jobAbortCleanup = {
         param($job)
-        $results.Add(@{ Command = $job['Command']; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; StartError = $null; Aborted = $true; TimedOut = $false })
+        $results.Add((New-PkBatchResult -Command $job['Command'] -Aborted))
     }.GetNewClosure()
 
     $dispatchParams = @{
@@ -1312,7 +1334,7 @@ function Invoke-PkProcessBatch {
     }
     $dispatch = Invoke-PkProcessDispatch @dispatchParams
 
-    return @{ Results = $results; Aborted = $dispatch.Aborted; ForceKilledCount = $dispatch.ForceKilledCount }
+    return [pscustomobject][ordered]@{ Results = $results; Aborted = $dispatch.Aborted; ForceKilledCount = $dispatch.ForceKilledCount }
 }
 
 # ==============================================================================
@@ -1324,7 +1346,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'ConvertTo-PkArgumentString')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString')
 }
 
 function Receive-PkCompletedHandles {
@@ -1431,7 +1453,7 @@ function Invoke-PkRunspaceJobs {
     #   PollCallback         { }                 main thread, every loop pass
     #   JobCrashedHandler    { param($errorRecord) }  main thread, when a worker throws
     #
-    # Returns @{ ForceStoppedCount; CrashedCount; Aborted }.
+    # Returns an object with ForceStoppedCount, CrashedCount, Aborted.
     param(
         [Parameter(Mandatory)]
         [scriptblock]$WorkerScript,
@@ -1476,8 +1498,8 @@ function Invoke-PkRunspaceJobs {
         $JobParams = $normalizedJobs
     }
 
-    $outcome = @{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false }
-    if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return $outcome }
+    $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false }
+    if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return [pscustomobject]$outcome }
 
     if ($CheckWorkerSafety) {
         $safetyFindings = Test-PkWorkerSafety -WorkerScript $WorkerScript -SharedFunctionNames $SharedFunctionNames
@@ -1674,7 +1696,7 @@ function Invoke-PkRunspaceJobs {
         if ($registeredCallerCts) { Unregister-PkCancellationSource -Cts $Cts }
     }
 
-    return $outcome
+    return [pscustomobject]$outcome
 }
 
 # ==============================================================================
@@ -1770,7 +1792,7 @@ function Get-PkScriptBlockJobMessage {
 function Test-PkWorkerSafety {
     # Static check of a worker script and the functions shared with it.
     # Returns a list of findings (empty = clean); each is
-    # @{ Rule; Where; Line; Text }. Put "# pk:ignore" on a line to accept it.
+    # an object with Rule, Where, Line, Text. Put "# pk:ignore" on a line to accept it.
     #
     #   MissingFunction  the worker calls one of your functions that isn't in -SharedFunctionNames
     #   ScriptVariable   a shared function (or a nested scriptblock or function in the worker) uses $script:
@@ -1786,7 +1808,7 @@ function Test-PkWorkerSafety {
         [string[]]$SharedFunctionNames = @()
     )
 
-    $findings = [System.Collections.Generic.List[hashtable]]::new()
+    $findings = [System.Collections.Generic.List[object]]::new()
     $kitNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-PkWorkerSafeFunctionNames), [System.StringComparer]::OrdinalIgnoreCase)
     $listed   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($n in $kitNames)            { $null = $listed.Add($n) }
@@ -1799,7 +1821,7 @@ function Test-PkWorkerSafety {
         if ($kitNames.Contains($n)) { continue }
         $fn = Get-Item ("Function:\" + $n) -ErrorAction SilentlyContinue
         if ($null -eq $fn) {
-            $findings.Add(@{ Rule = 'MissingFunction'; Where = '-SharedFunctionNames'; Line = 0; Text = ("-SharedFunctionNames lists '" + $n + "', which is not a defined function") })
+            $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = '-SharedFunctionNames'; Line = 0; Text = ("-SharedFunctionNames lists '" + $n + "', which is not a defined function") })
             continue
         }
         $targets.Add(@{ Where = ("function " + $n); Ast = $fn.ScriptBlock.Ast; IsWorkerBody = $false })
@@ -1816,10 +1838,10 @@ function Test-PkWorkerSafety {
             if (-not $kindCache.ContainsKey($cmdName)) { $kindCache[$cmdName] = Get-PkCommandKind -Name $cmdName }
             $kind = $kindCache[$cmdName]
             if ($kind -eq 'Function' -and -not $listed.Contains($cmdName)) {
-                $findings.Add(@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
+                $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
                                  Text = ($t.Where + " (line " + $c.Extent.StartLineNumber + ") calls '" + $cmdName + "', which is not in -SharedFunctionNames") })
             } elseif ($kind -eq 'UnloadableModuleFunction' -and -not $listed.Contains($cmdName)) {
-                $findings.Add(@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
+                $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
                                  Text = ($t.Where + " (line " + $c.Extent.StartLineNumber + ") calls '" + $cmdName + "', from a module a worker can't load by name (imported by path?) - put the module on `$env:PSModulePath, or list the function in -SharedFunctionNames") })
             }
         }
@@ -1841,7 +1863,7 @@ function Test-PkWorkerSafety {
             foreach ($ref in $scopeAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.IsScript }, $true)) {
                 if (-not $seenRefs.Add($ref.Extent.StartOffset)) { continue }
                 if ($ref.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
-                $findings.Add(@{ Rule = 'ScriptVariable'; Where = $t.Where; Line = $ref.Extent.StartLineNumber
+                $findings.Add([pscustomobject][ordered]@{ Rule = 'ScriptVariable'; Where = $t.Where; Line = $ref.Extent.StartLineNumber
                                  Text = ($t.Where + " (line " + $ref.Extent.StartLineNumber + ") uses `$" + $ref.VariablePath.UserPath + " - it can silently read as empty in a worker") })
             }
         }
@@ -1849,7 +1871,7 @@ function Test-PkWorkerSafety {
         foreach ($cv in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) {
             if ($cv.Type.TypeName.Name -notmatch '^(System\.)?(Func|Action|Predicate|Comparison|Converter)(\[|`|$)') { continue }
             if ($cv.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
-            $findings.Add(@{ Rule = 'DelegateCast'; Where = $t.Where; Line = $cv.Extent.StartLineNumber
+            $findings.Add([pscustomobject][ordered]@{ Rule = 'DelegateCast'; Where = $t.Where; Line = $cv.Extent.StartLineNumber
                              Text = ($t.Where + " (line " + $cv.Extent.StartLineNumber + ") casts a scriptblock to the delegate [" + $cv.Type.TypeName.Name + "] - this can hang or crash a worker") })
         }
 
@@ -1892,7 +1914,7 @@ function Test-PkWorkerSafety {
             }
             if ($null -eq $passed) { continue }
             if ($call.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
-            $findings.Add(@{ Rule = 'DelegateCast'; Where = $t.Where; Line = $call.Extent.StartLineNumber
+            $findings.Add([pscustomobject][ordered]@{ Rule = 'DelegateCast'; Where = $t.Where; Line = $call.Extent.StartLineNumber
                              Text = ($t.Where + " (line " + $call.Extent.StartLineNumber + ") passes " + $passed + " to ." + $memberName + "() - .NET turns it into a delegate, which can hang or crash a worker (add '# pk:ignore' if this method really takes a scriptblock)") })
         }
     }
