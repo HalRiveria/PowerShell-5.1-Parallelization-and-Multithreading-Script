@@ -238,10 +238,10 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 | Function | Use |
 |---|---|
 | `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns `@{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError }`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
-| `Stop-PkProcessTree -Process` | Kill a program and every program it started. Returns `$false` if it had already exited. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
+| `Stop-PkProcessTree -Process` | Kill a program and every program it started. Returns `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
