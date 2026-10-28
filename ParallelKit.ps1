@@ -13,6 +13,14 @@
 # function called from inside a .GetNewClosure()'d block can see an empty
 # $script: scope, and a static has no scope to lose.
 
+# Everything below needs Add-Type, which Constrained Language Mode blocks with
+# an error that doesn't say why. Say why.
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    throw ("ParallelKit: this PowerShell session runs in " + $ExecutionContext.SessionState.LanguageMode + " mode, but the kit needs FullLanguage " +
+        "(it compiles C# with Add-Type). This is usually set by AppLocker or Windows Defender Application Control policy. " +
+        "Ask whoever manages the machine to allow this script, or run it where that policy doesn't apply.")
+}
+
 # ==============================================================================
 #  Native types (guarded so the file can be dot-sourced more than once)
 # ==============================================================================

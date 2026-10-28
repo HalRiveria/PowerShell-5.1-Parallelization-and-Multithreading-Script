@@ -282,6 +282,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 ## Limits
 
 - Windows PowerShell 5.1, Windows only (console and Job Object APIs).
+- It needs FullLanguage mode, since it compiles a little C# with `Add-Type` when loaded. On a machine locked down to Constrained Language Mode (usually by AppLocker or Windows Defender Application Control), loading it fails with a message saying so. Some endpoint security products also flag scripts that compile code calling Windows APIs at runtime; if yours blocks the kit, that's the likely reason.
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
 - One run at a time per process. The abort state is shared. A nested `Invoke-PkRun` just runs inside the outer one.
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.

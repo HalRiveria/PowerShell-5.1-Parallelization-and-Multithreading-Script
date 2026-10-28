@@ -691,6 +691,17 @@ $probeThreads = 0
 if ($probe.Stdout -match 'threads=(\d+)') { $probeThreads = [int]$Matches[1] }
 Test-Assert ($probeThreads -ge 128) ("and raises the thread pool by itself (minimum " + $probeThreads + ")")
 
+# Loading the kit in Constrained Language Mode fails with a message that
+# says so. Needs a fresh process: the mode can't be set back.
+$clmScript = Join-Path $env:TEMP ("pk-clm-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($clmScript, @"
+`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
+try { . '$kitPath'; Write-Output 'loaded' } catch { Write-Output ('error: ' + `$_) }
+"@)
+$clm = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $clmScript + '"') -TimeoutMs 60000
+[System.IO.File]::Delete($clmScript)
+Test-Assert ($clm.Stdout -like '*ConstrainedLanguage mode, but the kit needs FullLanguage*') ("loading in Constrained Language Mode fails with a message naming the problem (" + ([string]$clm.Stdout).Trim() + ")")
+
 # The dispatcher sizes the pool for its own concurrency.
 $feed = @{ Given = $false }
 $null = Invoke-PkProcessDispatch -MaxConcurrent 100 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
