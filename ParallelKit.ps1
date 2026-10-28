@@ -745,18 +745,27 @@ function Start-PkProcess {
 
 function Stop-PkProcessTree {
     # .SYNOPSIS
-    # Kills a program and every program it started.
+    # Kills one or more programs and every program they started.
     # .DESCRIPTION
-    # Uses taskkill /T, so none of them is left running and holding the program's
-    # output open; falls back to killing just the program.
+    # Uses one taskkill /T call for all of them, so none is left running and
+    # holding a program's output open; falls back to killing each program
+    # directly.
     # .PARAMETER Process
-    # The program, such as the Proc that Start-PkProcess returns.
+    # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
-    # [bool] $true if this call killed it, $false if it had already exited.
-    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
-    if ($Process.HasExited) { return $false }
+    # [bool] For one program, $true if this call killed it and $false if it
+    # had already exited. For several, $true if this call killed any of them.
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Diagnostics.Process[]]$Process
+    )
+    $alive = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    foreach ($p in $Process) { if ($null -ne $p -and -not $p.HasExited) { $alive.Add($p) } }
+    if ($alive.Count -eq 0) { return $false }
     $killed = $false
-    $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F /PID ' + $Process.Id))
+    $pidArgs = foreach ($p in $alive) { '/PID ' + $p.Id }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F ' + ($pidArgs -join ' ')))
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -766,12 +775,23 @@ function Stop-PkProcessTree {
         try {
             if ($taskkill.WaitForExit(10000)) { $killed = ($taskkill.ExitCode -eq 0) }
         } finally { $taskkill.Dispose() }
-    } catch { }  # taskkill missing or blocked: the fallback below still kills the process itself
-    if (-not $killed -and -not $Process.HasExited) {
-        try { $Process.Kill(); $killed = $true } catch { }  # it exited between the check and the kill
+    } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
+    foreach ($p in $alive) {
+        if (-not $p.HasExited) {
+            try { $p.Kill(); $killed = $true } catch { }  # it exited between the check and the kill
+        }
     }
-    if ($killed) { $null = $Process.WaitForExit(5000) }
+    if ($killed) { foreach ($p in $alive) { $null = $p.WaitForExit(5000) } }
     return $killed
+}
+
+function Stop-PkJobProcesses {
+    # The dispatcher's force-stop: every running job's process tree in one
+    # Stop-PkProcessTree call, rather than one taskkill per job. A custom
+    # starter's .Proc may not be a Process; those are skipped.
+    param([System.Collections.Generic.List[hashtable]]$Jobs)
+    $procs = foreach ($job in $Jobs) { if ($job['Proc'] -is [System.Diagnostics.Process]) { $job['Proc'] } }
+    try { $null = Stop-PkProcessTree -Process @($procs) } catch { }  # best effort; each job is still waited on and disposed after
 }
 
 function Wait-PkProcess {
@@ -851,7 +871,8 @@ function Invoke-PkProcessWithTimeout {
     # Runs one program to completion, with a hard time limit.
     # .DESCRIPTION
     # Throws if the program had to be killed: because it ran past -TimeoutMs, or
-    # because the run was aborted or cancelled while it was going.
+    # because the run was aborted or cancelled while it was going. Anything the
+    # program started is killed with it.
     # .PARAMETER FilePath
     # The program to run.
     # .PARAMETER Arguments
@@ -897,7 +918,7 @@ function Invoke-PkProcessWithTimeout {
             if (-not $exited -and -not $IgnoreAbort -and ((Test-PkAbortSignal) -or (Test-PkCancelRequested))) { $stopWhy = "was stopped because the run is being aborted"; break }
         }
         if (-not $exited) {
-            try { $job['Proc'].Kill() } catch { }   # already-exited race - the throw below still reports why
+            try { $null = Stop-PkProcessTree -Process $job['Proc'] } catch { }   # best effort - the throw below still reports why
             # Let the two output reads finish (the kill closes their pipes)
             # before the process is disposed under them. Bounded, and any
             # read error is irrelevant - the stop reason is what gets reported.
@@ -958,7 +979,9 @@ function Invoke-PkProcessDispatch {
     # Stops the dispatcher when cancelled. An abort stops it either way, without
     # cancelling this token.
     # .PARAMETER AbortTimeoutSeconds
-    # How long an abort waits for running jobs before force-stopping them (default 60).
+    # How long an abort waits for running jobs before force-stopping them
+    # (default 60). A force-stopped program is killed along with anything it
+    # started.
     # .PARAMETER MaxQueueAhead
     # How many groups to pull ahead of the ones running (default 3).
     # .PARAMETER GroupReleaseCheck
@@ -1253,8 +1276,8 @@ function Invoke-PkProcessDispatchCore {
     }
     } catch {
         # Best-effort teardown on the way out; the original error is rethrown.
+        Stop-PkJobProcesses -Jobs $running
         foreach ($job in $running) {
-            try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
             try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
             if (-not $job['SlotReleased']) {
                 try { $null = & $JobAbortCleanup $job } catch { }
@@ -1373,8 +1396,8 @@ function Invoke-PkProcessDispatchCore {
             if ($running.Count -gt 0) {
                 $dispatchResult.ForceKilledCount = $running.Count
                 Write-PkMessage ("ProcessDispatch: force-stopping " + $running.Count + " job(s) that did not finish within " + $AbortTimeoutSeconds + "s.") -Level Warn
+                Stop-PkJobProcesses -Jobs $running
                 foreach ($job in $running) {
-                    try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
                     try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
                     try { $null = & $JobAbortCleanup $job } catch { }
                     try { if ($job['Proc']) { $job['Proc'].Dispose() } } catch { }
@@ -1383,8 +1406,8 @@ function Invoke-PkProcessDispatchCore {
                 }
             }
         } catch {
+            Stop-PkJobProcesses -Jobs $running
             foreach ($job in $running) {
-                try { if ($job['Proc'] -and -not $job['Proc'].HasExited) { $job['Proc'].Kill() } } catch { }
                 try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
                 if (-not $job['SlotReleased']) {
                     try { $null = & $JobAbortCleanup $job } catch { }
@@ -1576,7 +1599,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Resolve-PkEncoding',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString')

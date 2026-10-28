@@ -249,7 +249,7 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
-| `Stop-PkProcessTree -Process` | Kill a program and every program it started. Returns `$false` if it had already exited. |
+| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started, in one `taskkill` call. For one program, returns `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
@@ -365,7 +365,7 @@ The ones in this README: the engines, the [single-process functions](#single-pro
 
 **Does a program I start get my Ctrl+C too?**
 
-No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one, the kit kills it.
+No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one (a timeout, or an abort's force-stop), the kit kills it along with anything it started.
 
 **Was this written by AI?**
 
