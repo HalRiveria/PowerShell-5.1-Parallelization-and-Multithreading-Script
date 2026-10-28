@@ -93,7 +93,7 @@ It works whether or not your script uses `Set-StrictMode`.
 
 Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
 
-`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns `@{ AbortHandler; ChildProcessJob; ThreadPool }`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
+`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
 Each public function has a comment block at the top of its definition in `ParallelKit.ps1` listing its parameters and what it returns. `Get-Help` doesn't show these; read the file.
 
@@ -119,7 +119,7 @@ Long parameter lists in these examples use splatting (`@batchParams`) instead of
 
 Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
 
-`Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted; TimedOut }`, with every field always present:
+`Invoke-PkProcessBatch` returns an object with `Results`, `Aborted` and `ForceKilledCount`. Each result is an object with `Command`, `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut`, `StreamError`, `StartError`, `Aborted` and `TimedOut`, every field always present, so `$batch.Results | Format-Table` reads well:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
@@ -175,7 +175,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
 - `-JobCrashedHandler { param($err) ... }` is told when a worker throws. That job's result handler isn't called.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
-- Returns `@{ ForceStoppedCount; CrashedCount; Aborted }`.
+- Returns an object with `ForceStoppedCount`, `CrashedCount` and `Aborted`.
 
 ## The two rules for worker code
 
@@ -229,7 +229,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running.
 - `-CancelToken` stops the dispatcher when cancelled. An abort stops it either way, without cancelling your token.
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
-- Returns `@{ GroupResults; Aborted; ForceKilledCount; JobStarterFailedCount }`. `GroupResults` holds one `@{ GroupInfo; Completed; Aborted }` per group, where `GroupInfo` is the group value.
+- Returns an object with `GroupResults`, `Aborted`, `ForceKilledCount` and `JobStarterFailedCount`. `GroupResults` holds one object with `GroupInfo`, `Completed` and `Aborted` per group, where `GroupInfo` is the group value.
 
 Closures: build every callback that uses your local variables with `{ ... }.GetNewClosure()`. Without it, a variable name that happens to match one inside the kit silently reads the kit's value instead of yours. And keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a closure doesn't stick between calls.
 
@@ -237,7 +237,7 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 
 | Function | Use |
 |---|---|
-| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns `@{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError }`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
+| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns an object with `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut` and `StreamError`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
 | `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line, for any `-Arguments` / `Arguments` value. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
