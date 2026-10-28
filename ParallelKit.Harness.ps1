@@ -43,6 +43,9 @@ function New-JobList {
 }
 
 $cmdExe  = Join-Path $env:SystemRoot "System32\cmd.exe"
+# Whichever PowerShell is running the harness (powershell.exe or pwsh.exe),
+# for the tests that need a fresh process of the same version.
+$selfExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $pingExe = Join-Path $env:SystemRoot "System32\ping.exe"
 
 # A user function the workers share.
@@ -695,7 +698,7 @@ $clmScript = Join-Path $env:TEMP ("pk-clm-" + [guid]::NewGuid().ToString("N") + 
 `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
 try { . '$kitPath'; Write-Output 'loaded' } catch { Write-Output ('error: ' + `$_) }
 "@)
-$clm = Invoke-PkProcessWithTimeout -FilePath (Join-Path $PSHOME "powershell.exe") -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $clmScript + '"') -TimeoutMs 60000
+$clm = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $clmScript + '"') -TimeoutMs 60000
 [System.IO.File]::Delete($clmScript)
 Test-Assert ($clm.Stdout -like '*ConstrainedLanguage mode, but the kit needs FullLanguage*') ("loading in Constrained Language Mode fails with a message naming the problem (" + ([string]$clm.Stdout).Trim() + ")")
 
