@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/HalRiveria/PowerShell-ParallelKit/actions/workflows/tests.yml/badge.svg)](https://github.com/HalRiveria/PowerShell-ParallelKit/actions/workflows/tests.yml)
 
-Run thousands of command-line programs, or blocks of PowerShell code, in parallel from Windows PowerShell 5.1, and stop cleanly when you press Ctrl+C. One file, nothing to install.
+Run thousands of command-line programs, or blocks of PowerShell code, in parallel from Windows PowerShell 5.1 (or PowerShell 7 on Windows), and stop cleanly when you press Ctrl+C. One file, nothing to install.
 
 - **Process dispatch** - run many external programs, a set number at a time, with their output captured.
 - **Runspace jobs** - run a PowerShell worker script many times in parallel.
@@ -64,7 +64,7 @@ Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C. (For `Invoke-
 
 For running PowerShell code in parallel, most of these are fine and some are simpler. ParallelKit is mainly about running external programs, and about what happens when a run is stopped partway through.
 
-- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer if you can use PowerShell 7. ParallelKit is for scripts and machines that are stuck on 5.1.
+- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer for plain parallel PowerShell code if you can use PowerShell 7. ParallelKit was built for scripts and machines stuck on 5.1, though it runs on 7 too, where it still adds the external-program handling and graceful Ctrl+C.
 - **`Start-Job`.** Built in, but each job is a whole new `powershell.exe` process, so every job costs noticeable startup time and memory, and what it returns comes back as serialized copies (properties only, no methods). 5.1's `Start-Job` has no throttle either, so you write the wait-for-a-free-slot loop yourself. Fine for a handful of long jobs, poor for thousands of short ones.
 - **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (it ships with PowerShell 7, not 5.1).
 - **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. For this purpose it has the same strengths and gaps as ThreadJob.
@@ -82,7 +82,7 @@ What none of them do for you:
 
 ## Setup
 
-Requires Windows and Windows PowerShell 5.1. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.0 and later), put it in your project, and dot-source it from your script:
+Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.0 and later), put it in your project, and dot-source it from your script:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
@@ -298,7 +298,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 
 ## Limits
 
-- Windows PowerShell 5.1, Windows only (console and Job Object APIs).
+- Windows only (console and Job Object APIs). Built for Windows PowerShell 5.1; PowerShell 7 on Windows passes the same test suite.
 - Run it in a PowerShell console window or an editor's terminal (graceful Ctrl+C tested in Windows Terminal and Visual Studio's built-in terminal). The Windows PowerShell ISE isn't supported: tested there, the kit loads and runs, but the ISE has no console, so Ctrl+C stops the script outright, with no graceful drain and no cleanup callbacks.
 - It needs FullLanguage mode, since it compiles a little C# with `Add-Type` when loaded. On a machine locked down to Constrained Language Mode (usually by AppLocker or Windows Defender Application Control), loading it fails with a message saying so. Some endpoint security products also flag scripts that compile code calling Windows APIs at runtime; if yours blocks the kit, that's the likely reason.
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
@@ -318,7 +318,7 @@ powershell -NoProfile -File .\ParallelKit.Harness.ps1
 
 It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
-GitHub runs the same harness on Windows PowerShell 5.1 for every pull request and every change to `main`.
+GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`.
 
 ## FAQ
 
@@ -332,7 +332,7 @@ It hasn't been tested with them. The cause is in PowerShell itself, not in this 
 
 **Does it work in PowerShell 7, or on Linux or macOS?**
 
-It's written for and tested on Windows PowerShell 5.1 only. Ctrl+C handling, child-process cleanup and keep-awake all use Windows APIs, so Linux and macOS are out. On PowerShell 7 for Windows it isn't tested, and `ForEach-Object -Parallel` covers most needs there anyway.
+PowerShell 7 on Windows, yes: Windows PowerShell 5.1 is the main target, but the full test suite runs on both for every change. Linux and macOS are out, since Ctrl+C handling, child-process cleanup and keep-awake all use Windows APIs. On 7, `ForEach-Object -Parallel` is simpler for plain parallel PowerShell code; the kit is still useful for running external programs and for stopping cleanly on Ctrl+C.
 
 **Does it need admin rights?**
 
