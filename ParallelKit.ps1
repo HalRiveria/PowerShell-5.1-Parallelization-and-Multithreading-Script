@@ -664,6 +664,12 @@ function Stop-PkProcessTree {
             if ($taskkill.WaitForExit(10000)) { $killed = ($taskkill.ExitCode -eq 0) }
         } finally { $taskkill.Dispose() }
     } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
+    # With several PIDs taskkill reports failure if any one was already gone
+    # (it exited, or was a child in another listed tree) even when it killed
+    # the rest; count it as killing them if any listed process is now gone.
+    if (-not $killed -and $alive.Count -gt 1) {
+        foreach ($p in $alive) { if ($p.HasExited) { $killed = $true; break } }
+    }
     foreach ($p in $alive) {
         if (-not $p.HasExited) {
             try { $p.Kill(); $killed = $true } catch { }  # it exited between the check and the kill
