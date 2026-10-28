@@ -451,6 +451,26 @@ $leaked = Invoke-PkRun -ScriptBlock { return (Test-PkAbortSignal) }
 Test-Assert ($leaked -eq $false) "each run starts with a clean abort state"
 Write-Host ""
 
+# Every public function has Get-Help help: a synopsis, and a description for
+# each of its parameters.
+$publicFunctions = @('Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
+    'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',
+    'Get-PkAbortTriggerLabel', 'Invoke-PkRun', 'ConvertTo-PkArgumentString', 'Start-PkProcess', 'Stop-PkProcessTree',
+    'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout', 'Invoke-PkProcessDispatch', 'Invoke-PkProcessBatch',
+    'Invoke-PkRunspaceJobs', 'Test-PkWorkerSafety')
+$helpGaps = foreach ($fn in $publicFunctions) {
+    $help = Get-Help -Name $fn -Full
+    if ([string]::IsNullOrWhiteSpace([string]$help.Synopsis) -or ([string]$help.Synopsis).Trim().StartsWith($fn)) { $fn + ': no synopsis' }
+    foreach ($p in (Get-Command -Name $fn).Parameters.Keys) {
+        if ($p -in [System.Management.Automation.PSCmdlet]::CommonParameters) { continue }
+        $ph = @($help.parameters.parameter | Where-Object { $_.name -eq $p })
+        $desc = ''
+        if ($ph.Count -gt 0 -and $null -ne $ph[0].PSObject.Properties['description']) { $desc = ($ph[0].description | ForEach-Object { $_.Text }) -join '' }
+        if ([string]::IsNullOrWhiteSpace($desc)) { $fn + ' -' + $p }
+    }
+}
+Test-Assert (@($helpGaps).Count -eq 0) ("every public function has Get-Help help for itself and each parameter (missing: " + (@($helpGaps) -join ', ') + ")")
+
 # ==============================================================================
 Write-Host "=== K: worker-safety check ===" -ForegroundColor Cyan
 Reset-Harness
