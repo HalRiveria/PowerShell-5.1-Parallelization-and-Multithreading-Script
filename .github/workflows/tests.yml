@@ -25,8 +25,8 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ParallelKit.Harness.ps1
           exit $LASTEXITCODE
 
-  # PowerShell 7 isn't a supported target. This job is informational, to see
-  # whether the kit keeps working there; it isn't a required check.
+  # PowerShell 7 on Windows is supported alongside 5.1, so this is a required
+  # check too.
   harness-pwsh:
     name: Harness (PowerShell 7)
     runs-on: windows-latest
