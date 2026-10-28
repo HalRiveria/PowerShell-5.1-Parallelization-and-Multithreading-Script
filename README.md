@@ -23,7 +23,7 @@ Most uses are this: a list of command-line programs, run a few at a time, where 
 . "$PSScriptRoot\ParallelKit.ps1"
 
 $commands = foreach ($f in Get-ChildItem *.png) {
-    @{ FilePath = 'cjxl.exe'; Arguments = ('"{0}" "{0}.jxl"' -f $f.FullName) }
+    @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")) }
 }
 $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
 
@@ -102,7 +102,7 @@ Each public function has a comment block at the top of its definition in `Parall
 ```powershell
 # Any command-line tool works. cjxl is a JPEG XL image encoder.
 $commands = foreach ($f in Get-ChildItem *.png) {
-    @{ FilePath = 'cjxl.exe'; Arguments = ('"{0}" "{0}.jxl"' -f $f.FullName); Source = $f }
+    @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")); Source = $f }
 }
 $batchParams = @{
     Commands      = $commands
@@ -117,7 +117,7 @@ $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 
 Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
 
-Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written, so put quotes around paths that may contain spaces (as above). Programs run hidden, with their output captured.
+Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
 
 `Invoke-PkProcessBatch` returns `@{ Results; Aborted; ForceKilledCount }`. Each result is `@{ Command; ExitCode; Stdout; Stderr; StreamTimedOut; StreamError; StartError; Aborted }`, with every field always present:
 
@@ -235,6 +235,7 @@ Closures: build every callback that uses your local variables with `{ ... }.GetN
 | Function | Use |
 |---|---|
 | `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns `@{ ExitCode; Stdout; Stderr; StreamTimedOut; StreamError }`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
+| `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line, for any `-Arguments` / `Arguments` value. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |

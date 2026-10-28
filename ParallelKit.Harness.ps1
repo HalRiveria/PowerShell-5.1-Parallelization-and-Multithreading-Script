@@ -183,6 +183,32 @@ $j = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
 $null = Wait-PkProcess -Process $j.Proc -TimeoutMs 5000
 Test-Assert ([PkChildProcessJob]::Assign($j.Proc) -or $j.Proc.HasExited) "started processes are tied to the job object"
 $j.Proc.Dispose()
+
+# ConvertTo-PkArgumentString: exact output for the tricky cases, then a
+# round trip through a real program that prints each argument it received.
+Test-Assert ((ConvertTo-PkArgumentString @('plain', 'two words', '')) -eq 'plain "two words" ""') "arguments with spaces are quoted, empty ones become `"`""
+Test-Assert ((ConvertTo-PkArgumentString @('C:\dir with space\')) -eq '"C:\dir with space\\"') "a trailing backslash is doubled inside quotes"
+Test-Assert ((ConvertTo-PkArgumentString @('say "hi"', 'a\"b')) -eq '"say \"hi\"" "a\\\"b"') "quotes are escaped, and backslashes before them doubled"
+Test-Assert ((ConvertTo-PkArgumentString @('C:\no\spaces\')) -eq 'C:\no\spaces\') "an argument that needs no quotes is left alone"
+# Built with the .NET Framework's csc.exe (on every Windows machine) rather
+# than Add-Type, which can't build an .exe under PowerShell 7.
+$argvExe = Join-Path $env:TEMP ("pk-argv-" + [guid]::NewGuid().ToString("N") + ".exe")
+$argvSrc = [System.IO.Path]::ChangeExtension($argvExe, '.cs')
+[System.IO.File]::WriteAllText($argvSrc, 'public static class PkArgv { public static void Main(string[] args) { foreach (string a in args) { System.Console.WriteLine("[" + a + "]"); } } }')
+$cscExe = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $argvExe), $argvSrc)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($argvSrc)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($argvExe))
+Test-Assert $compiled "the argument-printing test program compiles"
+if ($compiled) {
+    $tricky = @('plain', 'two words', '', 'C:\dir with space\', 'say "hi"', 'a\"b', 'tab	here', 'x\\y', '\\server\share\')
+    $r = Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments (ConvertTo-PkArgumentString $tricky)
+    $received = @(([string]$r.Stdout).Split([string[]]@("`r`n"), [System.StringSplitOptions]::RemoveEmptyEntries))
+    $expected = @($tricky | ForEach-Object { "[" + $_ + "]" })
+    Test-Assert (($received -join '|') -eq ($expected -join '|')) ("a program receives exactly the arguments given (got " + ($received -join ' ') + ")")
+    try { [System.IO.File]::Delete($argvExe) } catch { }  # temp file only; best effort
+}
 Write-Host ""
 
 # ==============================================================================

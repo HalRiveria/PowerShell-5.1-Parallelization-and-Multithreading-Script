@@ -525,6 +525,50 @@ function Invoke-PkRun {
 #  External processes (all raw .NET - safe inside workers)
 # ==============================================================================
 
+function ConvertTo-PkArgumentString {
+    # Joins arguments into one command line, quoting each so a program sees
+    # exactly that list: an argument with a space, tab, newline or quote is
+    # wrapped in quotes, its quotes become \", and backslashes are doubled
+    # where they come before a quote. These are the C runtime's rules, which
+    # most Windows programs use (cmd.exe's own parsing is different).
+    # .NET Framework's ProcessStartInfo has no ArgumentList, hence this.
+    #   ConvertTo-PkArgumentString @($in, '-o', $out)  ->  "C:\My Files\a.png" -o C:\out\a.jxl
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Arguments
+    )
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($arg in $Arguments) {
+        if ($null -eq $arg) { $arg = '' }
+        if ($arg.Length -gt 0 -and $arg.IndexOfAny([char[]]@(' ', "`t", "`n", "`v", '"')) -lt 0) {
+            $parts.Add($arg)
+            continue
+        }
+        $sb = [System.Text.StringBuilder]::new()
+        $null = $sb.Append('"')
+        $backslashes = 0
+        foreach ($ch in $arg.ToCharArray()) {
+            if ($ch -eq '\') { $backslashes++; continue }
+            if ($ch -eq '"') {
+                # Each backslash before a quote is doubled, then the quote escaped.
+                $null = $sb.Append('\', 2 * $backslashes + 1)
+                $null = $sb.Append('"')
+            } else {
+                if ($backslashes -gt 0) { $null = $sb.Append('\', $backslashes) }
+                $null = $sb.Append($ch)
+            }
+            $backslashes = 0
+        }
+        # Trailing backslashes are doubled so they don't escape the closing quote.
+        if ($backslashes -gt 0) { $null = $sb.Append('\', 2 * $backslashes) }
+        $null = $sb.Append('"')
+        $parts.Add($sb.ToString())
+    }
+    return ($parts -join ' ')
+}
+
 function Start-PkProcess {
     # Starts a hidden child process with stdout/stderr redirected and being
     # read asynchronously (so a chatty process can't block on a full pipe).
@@ -1232,7 +1276,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'ConvertTo-PkArgumentString')
 }
 
 function Receive-PkCompletedHandles {
