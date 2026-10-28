@@ -5,10 +5,6 @@
 # Read README.md first - the two worker-code rules there are what keep this
 # from hanging or crashing.
 #
-# Split off from Manga Conversion Script
-# (https://github.com/HalRiveria/Manga-Conversion-Script), where these pieces
-# were debugged against real hangs and deadlocks. No dependency on that project.
-#
 # Works under Set-StrictMode: job hashtables are read as $job['Name'], never
 # $job.Name, because under strict mode the dot form THROWS for a key that
 # isn't there yet. Keep it that way when editing.
