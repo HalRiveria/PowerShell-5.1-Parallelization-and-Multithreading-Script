@@ -209,6 +209,41 @@ if ($compiled) {
     Test-Assert (($received -join '|') -eq ($expected -join '|')) ("a program receives exactly the arguments given (got " + ($received -join ' ') + ")")
     try { [System.IO.File]::Delete($argvExe) } catch { }  # temp file only; best effort
 }
+
+# -OutputEncoding: a program that writes UTF-8 bytes comes back intact when
+# told so, and garbled when decoded as code page 437 (a default console).
+$u8Exe = Join-Path $env:TEMP ("pk-u8-" + [guid]::NewGuid().ToString("N") + ".exe")
+$u8Src = [System.IO.Path]::ChangeExtension($u8Exe, '.cs')
+[System.IO.File]::WriteAllText($u8Src, 'public static class PkU8 { public static void Main() { string t = new string(new char[] { (char)0x63, (char)0x61, (char)0x66, (char)0xE9, (char)0x20, (char)0x65E5, (char)0x672C, (char)0x8A9E }); byte[] b = new System.Text.UTF8Encoding(false).GetBytes(t); var o = System.Console.OpenStandardOutput(); o.Write(b, 0, b.Length); o.Flush(); var e = System.Console.OpenStandardError(); e.Write(b, 0, b.Length); e.Flush(); } }')
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $u8Exe), $u8Src)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($u8Src)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($u8Exe))
+Test-Assert $compiled "the UTF-8 test program compiles"
+if ($compiled) {
+    $u8Text = 'caf' + [char]0xE9 + ' ' + [char]0x65E5 + [char]0x672C + [char]0x8A9E
+    $r = Invoke-PkProcessWithTimeout -FilePath $u8Exe -OutputEncoding 'utf-8'
+    $codes = { param($s) (([string]$s).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ' }
+    Test-Assert ($r.Stdout -eq $u8Text -and $r.Stderr -eq $u8Text) ("-OutputEncoding 'utf-8' decodes a program's UTF-8 output, stdout and stderr (got " + (& $codes $r.Stdout) + " / " + (& $codes $r.Stderr) + ")")
+    $r = Invoke-PkProcessWithTimeout -FilePath $u8Exe -OutputEncoding 437
+    Test-Assert ($r.Stdout -ne $u8Text) "and decoding it as code page 437 garbles it, so the option really takes effect"
+    $batch = Invoke-PkProcessBatch -OutputEncoding 'utf8' -Commands @(@{ FilePath = $u8Exe; Name = 'default' }, @{ FilePath = $u8Exe; Name = 'own'; OutputEncoding = 437 })
+    $byName = @{}; foreach ($br in $batch.Results) { $byName[$br.Command['Name']] = $br.Stdout }
+    Test-Assert ($byName['default'] -eq $u8Text -and $byName['own'] -ne $u8Text) "batch: -OutputEncoding applies to every command, and a command's own OutputEncoding key overrides it"
+    try { [System.IO.File]::Delete($u8Exe) } catch { }  # temp file only; best effort
+}
+Test-Assert ((Resolve-PkEncoding -Encoding '437').CodePage -eq 437) "a code page given as text ('437') is accepted"
+# -OutputEncoding mustn't replace PowerShell's own $OutputEncoding inside the
+# caller's callbacks.
+$seen = @{ Value = 'unset' }
+$null = Invoke-PkProcessBatch -OutputEncoding 'utf-8' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -OnComplete { param($c, $r) $seen.Value = $OutputEncoding }.GetNewClosure()
+Test-Assert ($seen.Value -is [System.Text.Encoding]) ("inside -OnComplete, `$OutputEncoding is still PowerShell's own (got [" + $seen.Value + "])")
+$seen.Value = 'unset'
+$null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -OnComplete { param($c, $r) $seen.Value = $OutputEncoding }
+Test-Assert ($seen.Value -is [System.Text.Encoding]) ("and in an -OnComplete without .GetNewClosure() too (got [" + $seen.Value + "])")
+$threw = $false
+try { $null = Invoke-PkProcessBatch -OutputEncoding 'no-such-encoding' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) } catch { $threw = ($_.ToString() -like "*'no-such-encoding' isn't an encoding*") }
+Test-Assert $threw "an unknown -OutputEncoding fails the call with a clear message"
 Write-Host ""
 
 # ==============================================================================
@@ -332,7 +367,7 @@ $sw.Stop()
 Test-Assert ($dispatch.Aborted) "an abort mid-dispatch is reported as Aborted"
 Test-Assert ($dispatch.ForceKilledCount -eq 2) "the 2 running processes are force-killed after the abort timeout"
 Test-Assert ($cleaned.Count -eq 5) ("-JobAbortCleanup runs for killed AND never-started jobs (got " + $cleaned.Count + ")")
-Test-Assert ($dispatch -is [hashtable]) "the dispatcher returns exactly one result object, even on the force-kill path"
+Test-Assert ($dispatch -is [System.Management.Automation.PSCustomObject]) "the dispatcher returns exactly one result object, even on the force-kill path"
 Test-Assert ($dispatch.GroupResults.Count -eq 1 -and $dispatch.GroupResults[0].Aborted) "the unfinished group is reported as aborted"
 Test-Assert ($sw.Elapsed.TotalSeconds -lt 15) ("the dispatcher returns promptly (" + [int]$sw.Elapsed.TotalSeconds + "s), not after 30s of ping")
 Write-Host ""
@@ -501,11 +536,11 @@ $out = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(1..4
     -WorkerScript { param([int]$Id) for ($i = 0; $i -lt 50; $i++) { if (Test-PkCancelRequested) { return $Id }; [System.Threading.Thread]::Sleep(100) }; return $Id } `
     -ResultHandler { param($r) $true; 123 } `
     -PollCallback { $poll.Count++; if ($poll.Count -eq 4) { Request-PkAbort }; "noise" }.GetNewClosure()
-Test-Assert ($out -is [hashtable] -and $out.Aborted) "runspace jobs: noisy -ResultHandler/-PollCallback don't corrupt the result, even through an abort drain"
+Test-Assert ($out -is [System.Management.Automation.PSCustomObject] -and $out.Aborted) "runspace jobs: noisy -ResultHandler/-PollCallback don't corrupt the result, even through an abort drain"
 
 Reset-Harness
 $crashOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param($Id) throw "x" } -JobCrashedHandler { param($e) "noise"; 5 }
-Test-Assert ($crashOut -is [hashtable] -and $crashOut.CrashedCount -eq 1) "runspace jobs: a noisy -JobCrashedHandler doesn't corrupt the result"
+Test-Assert ($crashOut -is [System.Management.Automation.PSCustomObject] -and $crashOut.CrashedCount -eq 1) "runspace jobs: a noisy -JobCrashedHandler doesn't corrupt the result"
 
 Reset-Harness
 $feed = @{ Given = $false }; $ticks = @{ Count = 0 }
@@ -516,11 +551,11 @@ $noisy = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 `
     -JobAbortCleanup { param($job) "noise"; $true } `
     -GroupCompleteCallback { param($group) "noise"; 1 } `
     -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort }; "noise" }.GetNewClosure()
-Test-Assert ($noisy -is [hashtable] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-AbortPollCallback don't corrupt the result"
+Test-Assert ($noisy -is [System.Management.Automation.PSCustomObject] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-AbortPollCallback don't corrupt the result"
 
 Reset-Harness
 $noisyBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -MaxConcurrent 1 -OnComplete { param($c, $r) "noise"; $true }
-Test-Assert ($noisyBatch -is [hashtable] -and $noisyBatch.Results.Count -eq 1) "batch: a noisy -OnComplete doesn't corrupt the result"
+Test-Assert ($noisyBatch -is [System.Management.Automation.PSCustomObject] -and $noisyBatch.Results.Count -eq 1) "batch: a noisy -OnComplete doesn't corrupt the result"
 
 Set-PkMessageHandler -Handler { param($Message, $Level) "noise"; 42 }
 $leaked = Write-PkMessage "hello"
@@ -759,6 +794,36 @@ Test-Assert ($probe.Stdout -match 'before=False after=True') ("starting a proces
 $probeThreads = 0
 if ($probe.Stdout -match 'threads=(\d+)') { $probeThreads = [int]$Matches[1] }
 Test-Assert ($probeThreads -ge 128) ("and raises the thread pool by itself (minimum " + $probeThreads + ")")
+
+# A script run the way a prompt runs it (& script, or .\script.ps1) holds
+# the kit's functions in its own scope, where a .GetNewClosure() block can't
+# see them. The kit makes them global too, so the batch (whose callbacks are
+# closures) and a caller's closure that calls a kit function both work.
+# Needs a fresh process, started with -Command rather than -File.
+$promptScript = Join-Path $env:TEMP ("pk-prompt-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($promptScript, @"
+. '$kitPath'
+`$b = Invoke-PkProcessBatch -Commands @(@{ FilePath = '$cmdExe'; Arguments = '/c exit 7' })
+Write-Output ('batch=' + `$b.Results.Count + ',' + `$b.Results[0].ExitCode)
+`$tag = 'ok'
+`$closure = Invoke-PkRun { Test-PkCancelRequested | Out-Null; 'closure=' + `$tag }.GetNewClosure()
+Write-Output `$closure
+"@)
+$prompt = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $promptScript + "'"))) -TimeoutMs 60000
+[System.IO.File]::Delete($promptScript)
+Test-Assert ($prompt.Stdout -match 'batch=1,7') ("a batch works in a script run from a prompt (" + ([string]$prompt.Stdout + [string]$prompt.Stderr).Trim() + ")")
+Test-Assert ($prompt.Stdout -match 'closure=ok') "and so does a .GetNewClosure() block that calls a kit function"
+# Pasted into a larger script under strict mode, only the kit's functions
+# are made global: the script's own (here one defined after the kit, and
+# one before) are left alone, and loading raises no errors.
+$embedScript = Join-Path $env:TEMP ("pk-embed-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($embedScript, "Set-StrictMode -Version Latest`r`n`$ErrorActionPreference = 'Stop'`r`nfunction Get-HarnessBefore { 1 }`r`n`$fnAst = 'mine'`r`n" +
+    [System.IO.File]::ReadAllText($kitPath) +
+    "`r`nfunction Get-HarnessAfter { 2 }`r`nWrite-Output ('kitGlobal=' + [bool](Get-ChildItem Function: | Where-Object { `$_.Name -eq 'Start-PkProcess' }))`r`nWrite-Output ('caller var=' + `$fnAst)`r`n")
+$embed = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $embedScript + "'; 'before global=' + [bool](Get-Command Get-HarnessBefore -ErrorAction SilentlyContinue); 'after global=' + [bool](Get-Command Get-HarnessAfter -ErrorAction SilentlyContinue); 'kit global=' + [bool](Get-Command Start-PkProcess -ErrorAction SilentlyContinue)"))) -TimeoutMs 60000
+[System.IO.File]::Delete($embedScript)
+$embedOut = ([string]$embed.Stdout + [string]$embed.Stderr).Trim()
+Test-Assert ($embedOut -match 'kit global=True' -and $embedOut -match 'before global=False' -and $embedOut -match 'after global=False' -and $embedOut -match 'caller var=mine' -and [string]::IsNullOrWhiteSpace([string]$embed.Stderr)) ("pasted into a larger script, only the kit's functions are made global, without errors or touching the script's variables (" + ($embedOut -replace '\s+', ' ') + ")")
 
 # Loading the kit in Constrained Language Mode fails with a message that
 # says so. Needs a fresh process: the mode can't be set back.
@@ -999,6 +1064,15 @@ Test-Assert ($threw -and $sw.Elapsed.TotalSeconds -lt 6) ("Invoke-PkProcessWithT
 Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Ctrl+C detected*' }).Count -eq 1) "and the abort is announced"
 $null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
 
+# A window close gets no drain, so its announcement mustn't say it waits.
+Reset-Harness
+[PkConsoleCtrl]::IsCloseEvent = $true
+[PkConsoleCtrl]::AbortRequested = $true
+$null = Test-PkAbortSignal
+$closeMessage = @($script:messages | Where-Object { $_.Message -like '*Window close detected*' })
+Test-Assert ($closeMessage.Count -eq 1 -and $closeMessage[0].Message -notlike '*please wait*' -and $closeMessage[0].Message -like '*stopping*') ("a window close is announced as stopping jobs, not waiting for them (" + (@($closeMessage | ForEach-Object { $_.Message }) -join ' | ') + ")")
+Reset-PkAbortState
+
 # The same from inside a worker, where the run's cancel is what it sees.
 Reset-Harness
 $poll = @{ Count = 0 }
@@ -1132,18 +1206,35 @@ Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
 # Every batch result has every documented field, so a strict-mode caller
 # can read any of them without a "property cannot be found" error.
 Reset-Harness
+# Results are objects with their fields in a fixed order, so Format-Table
+# shows them readably.
+function Get-HarnessShape($o) { if ($o -isnot [System.Management.Automation.PSCustomObject]) { return '(not an object)' }; return ($o.PSObject.Properties.Name -join ',') }
+$shapeBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' })
+Test-Assert ((Get-HarnessShape $shapeBatch) -eq 'Results,Aborted,ForceKilledCount') ("a batch returns an object (" + (Get-HarnessShape $shapeBatch) + ")")
+Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
+$shapeOne = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0'
+Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
+$shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
+Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
+$shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
+Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
+$shapeFindings = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [Func[int]]{ 1 } }
+$shapeFinding = $shapeFindings[0]
+Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")
+Test-Assert ((Get-HarnessShape (Initialize-ParallelKit)) -eq 'AbortHandler,ChildProcessJob,ThreadPool') "Initialize-ParallelKit returns an object"
+
 $fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut')
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
     @{ FilePath = $cmdExe; Arguments = '/c exit 0' },
     @{ FilePath = 'C:\definitely\not\here.exe' })
-$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if ($r.PSObject.Properties.Name -notcontains $k) { $k } } }
 Test-Assert ($batch.Results.Count -eq 2 -and @($missing).Count -eq 0) ("batch results for a finished and an unstartable command carry every field (missing: " + (@($missing) -join ', ') + ")")
 
 # An abort already in force: nothing starts, every command comes back Aborted.
 Reset-Harness
 Request-PkAbort
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' })
-$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if (-not $r.ContainsKey($k)) { $k } } }
+$missing = foreach ($r in $batch.Results) { foreach ($k in $fields) { if ($r.PSObject.Properties.Name -notcontains $k) { $k } } }
 Test-Assert ($batch.Aborted -and $batch.Results.Count -eq 2 -and @($batch.Results | Where-Object { $_.Aborted }).Count -eq 2) "batch: commands an abort kept from starting come back marked Aborted"
 Test-Assert (@($missing).Count -eq 0) ("and their results carry every field too (missing: " + (@($missing) -join ', ') + ")")
 Reset-PkAbortState
@@ -1172,6 +1263,44 @@ $j = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
 $null = Wait-PkProcess -Process $j.Proc -TimeoutMs 5000
 Test-Assert (-not (Stop-PkProcessTree -Process $j.Proc)) "Stop-PkProcessTree reports `$false for a program that already exited"
 $j.Proc.Dispose()
+
+# Every other place the kit kills a program kills its children too: a
+# Invoke-PkProcessWithTimeout overrun, and the dispatcher's force-stop
+# after an abort. Each test's ping has its own count, so a surviving one
+# can be found by its command line.
+function Get-HarnessPingCount([int]$Count) {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $Count + " 127.0.0.1*") }).Count
+}
+$nestedPing = { param($n) '/c ""' + $pingExe + '" -n ' + $n + ' 127.0.0.1"' }
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments (& $nestedPing 41) -TimeoutMs 1500 } catch { }  # the overrun throw is expected
+Test-Assert ((Get-HarnessPingCount 41) -eq 0) "Invoke-PkProcessWithTimeout: an overrun kills the program's children too"
+Reset-Harness
+$abortTimer = [PowerShell]::Create()
+$null = $abortTimer.AddScript({ [System.Threading.Thread]::Sleep(1500); [PkConsoleCtrl]::AbortRequested = $true })
+$abortTimerHandle = $abortTimer.BeginInvoke()
+$batch = Invoke-PkProcessBatch -AbortTimeoutSeconds 1 -Commands @(@{ FilePath = $cmdExe; Arguments = (& $nestedPing 43) })
+$null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
+$several = @(45, 46, 47 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing $_) })
+Start-Sleep -Milliseconds 500
+$killedSeveral = Stop-PkProcessTree -Process @($several | ForEach-Object { $_.Proc })
+Test-Assert ($killedSeveral -and (Get-HarnessPingCount 45) -eq 0 -and (Get-HarnessPingCount 46) -eq 0 -and (Get-HarnessPingCount 47) -eq 0 -and @($several | Where-Object { -not $_.Proc.HasExited }).Count -eq 0) "Stop-PkProcessTree kills several programs and their children in one call"
+foreach ($j in $several) { $j.Proc.Dispose() }
+# A parent and its own child in the same call: both die, and the call says
+# it killed them. (The case this guards - taskkill failing for one PID that
+# exited a moment before - is a race this can't set up on demand.)
+$parentJob = Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 48)
+$childProc = $null
+$waitChild = [System.Diagnostics.Stopwatch]::StartNew()
+while ($null -eq $childProc -and $waitChild.Elapsed.TotalSeconds -lt 5) {
+    $childCim = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $parentJob.Proc.Id) | Where-Object { $_.Name -eq 'PING.EXE' })
+    if ($childCim.Count -gt 0) { $childProc = [System.Diagnostics.Process]::GetProcessById([int]$childCim[0].ProcessId) } else { Start-Sleep -Milliseconds 100 }
+}
+$killedPair = $false
+if ($null -ne $childProc) { $killedPair = Stop-PkProcessTree -Process @($parentJob.Proc, $childProc) }
+Test-Assert ($null -ne $childProc -and $killedPair -and $parentJob.Proc.HasExited -and $childProc.HasExited) ("Stop-PkProcessTree kills a parent and its child passed together, and says so (found child: " + ($null -ne $childProc) + ", returned: " + $killedPair + ")")
+$parentJob.Proc.Dispose(); if ($null -ne $childProc) { $childProc.Dispose() }
+Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 1 -and (Get-HarnessPingCount 43) -eq 0) ("dispatch: the force-stop after an abort kills the program's children too (aborted=" + $batch.Aborted + ", force-killed=" + $batch.ForceKilledCount + ")")
+Reset-PkAbortState
 $threw = $false
 try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -TimeoutSeconds -1 } catch { $threw = ($_.ToString() -like '*-TimeoutSeconds*') }
 Test-Assert $threw "a negative -TimeoutSeconds is refused"
