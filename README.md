@@ -80,7 +80,7 @@ What none of them do for you:
 
 ## Setup
 
-Requires Windows and Windows PowerShell 5.1. Copy `ParallelKit.ps1` into your project and dot-source it:
+Requires Windows and Windows PowerShell 5.1. Download `ParallelKit.ps1` from the [latest release](https://github.com/HalRiveria/PowerShell-ParallelKit/releases/latest), put it in your project, and dot-source it from your script:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
@@ -90,6 +90,8 @@ $null = Initialize-ParallelKit -MaxConcurrentProcesses 8
 If you downloaded the file, Windows marks it as coming from the internet and your execution policy may refuse to load it. Run `Unblock-File .\ParallelKit.ps1` once to clear that.
 
 It works whether or not your script uses `Set-StrictMode`.
+
+The version is in the comment block at the top of the file, so a copy kept in your project still says which one it is. That block also carries the licence notice; keep it with the file.
 
 Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
 
