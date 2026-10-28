@@ -1682,37 +1682,82 @@ function Invoke-PkRunspaceJobs {
 # ==============================================================================
 
 function Get-PkCommandKind {
+    # What a worker would need to run $Name: 'Function' (one of your session's
+    # functions - must be shared), 'UnloadableModuleFunction' (from a module a
+    # worker can't autoload), or 'Other' (cmdlet, program, autoloadable module
+    # function, or unknown). Reads the Alias: and Function: drives directly:
+    # Get-Command on a name that doesn't resolve searches every module on
+    # $env:PSModulePath, and the check runs on every Invoke-PkRunspaceJobs call.
     param([string]$Name)
-    $cmd = Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
     $hops = 0
-    while ($null -ne $cmd -and $cmd.CommandType -eq 'Alias' -and $hops -lt 5) {
-        $cmd = $cmd.ResolvedCommand
+    $alias = Get-Item -LiteralPath ("Alias:\" + $Name) -ErrorAction SilentlyContinue
+    while ($null -ne $alias -and $hops -lt 5) {
+        $Name = $alias.Definition
+        $alias = Get-Item -LiteralPath ("Alias:\" + $Name) -ErrorAction SilentlyContinue
         $hops++
     }
-    if ($null -eq $cmd) { return 'Unknown' }
-    # A function from a module (Get-FileHash, say) autoloads in a worker
-    # like a cmdlet does; only functions defined in your session need sharing.
-    if ($cmd.CommandType -eq 'Function' -and -not [string]::IsNullOrEmpty($cmd.ModuleName)) { return 'ModuleFunction' }
-    return [string]$cmd.CommandType
+    $fn = Get-Item -LiteralPath ("Function:\" + $Name) -ErrorAction SilentlyContinue
+    if ($null -eq $fn) { return 'Other' }
+    if ([string]::IsNullOrEmpty($fn.ModuleName)) { return 'Function' }
+    # A module function (Get-FileHash, say) autoloads in a worker like a
+    # cmdlet does - but only if the module can be found by name. One imported
+    # by path from elsewhere can't.
+    if ($null -ne (Get-Module -ListAvailable -Name $fn.ModuleName -ErrorAction SilentlyContinue | Select-Object -First 1)) { return 'Other' }
+    return 'UnloadableModuleFunction'
 }
 
 function Get-PkScriptBlockJobKey {
     # The first key of a job hashtable whose value is a scriptblock, or holds
-    # one (an array/list item or a hashtable value - one level down), else
-    # $null. A scriptblock belongs to the runspace that made it: run in a
-    # worker it executes against the main thread's session state, which can
-    # corrupt it (the kit's own functions vanish mid-run), crash, or hang.
+    # one up to three levels down (in arrays, lists, dictionaries and
+    # [pscustomobject]s), else $null. A scriptblock belongs to the runspace
+    # that made it: run in a worker it executes against the main thread's
+    # session state, which can corrupt it (the kit's own functions vanish
+    # mid-run), crash, or hang.
     param([Parameter(Mandatory)][hashtable]$Job)
     foreach ($key in $Job.Keys) {
-        $value = $Job[$key]
-        if ($value -is [scriptblock]) { return [string]$key }
-        if ($value -is [System.Collections.IDictionary]) {
-            foreach ($inner in $value.Values) { if ($inner -is [scriptblock]) { return [string]$key } }
-        } elseif ($value -is [System.Collections.IList]) {
-            foreach ($inner in $value) { if ($inner -is [scriptblock]) { return [string]$key } }
-        }
+        if (Test-PkHoldsScriptBlock -Value $Job[$key] -Depth 3) { return [string]$key }
     }
     return $null
+}
+
+function Test-PkHoldsScriptBlock {
+    # Get-PkScriptBlockJobKey's walk. Leaves (strings, numbers) are checked
+    # inline rather than through a call, so a big object[] stays cheap, and
+    # a collection whose element type can't hold anything (byte[], string[],
+    # List[int]) isn't walked at all.
+    param($Value, [int]$Depth)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [scriptblock]) { return $true }
+    if ($Depth -le 0) { return $false }
+    $type = $Value.GetType()
+    if ($Value -is [System.Collections.IDictionary]) {
+        $items = $Value.Values
+    } elseif ($Value -is [System.Collections.IList]) {
+        $items = $Value
+    } elseif ($type.FullName -eq 'System.Management.Automation.PSCustomObject') {
+        $items = foreach ($p in $Value.PSObject.Properties) { if ($p -is [System.Management.Automation.PSNoteProperty]) { $p.Value } }
+    } else {
+        return $false
+    }
+    $elementType = $null
+    if ($type.IsArray) { $elementType = $type.GetElementType() }
+    elseif ($type.IsGenericType) { $genericArgs = $type.GetGenericArguments(); $elementType = $genericArgs[$genericArgs.Length - 1] }
+    if ($null -ne $elementType -and ($elementType.IsValueType -or $elementType -eq [string])) { return $false }
+    try {
+        foreach ($inner in $items) {
+            if ($null -eq $inner -or $inner -is [string] -or $inner -is [System.ValueType]) { continue }
+            if ($inner -is [scriptblock]) { return $true }
+            if ($Depth -gt 1 -and (Test-PkHoldsScriptBlock -Value $inner -Depth ($Depth - 1))) { return $true }
+        }
+    } catch {
+        # A collection other threads are changing (a results sink shared by
+        # running workers) can't be enumerated safely; PowerShell may wrap
+        # the "collection was modified" error, so catch it whatever its type.
+        # Skip the value rather than fail the run: such sinks hold results,
+        # not code.
+        return $false
+    }
+    return $false
 }
 
 function Get-PkScriptBlockJobMessage {
@@ -1773,6 +1818,9 @@ function Test-PkWorkerSafety {
             if ($kind -eq 'Function' -and -not $listed.Contains($cmdName)) {
                 $findings.Add(@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
                                  Text = ($t.Where + " (line " + $c.Extent.StartLineNumber + ") calls '" + $cmdName + "', which is not in -SharedFunctionNames") })
+            } elseif ($kind -eq 'UnloadableModuleFunction' -and -not $listed.Contains($cmdName)) {
+                $findings.Add(@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
+                                 Text = ($t.Where + " (line " + $c.Extent.StartLineNumber + ") calls '" + $cmdName + "', from a module a worker can't load by name (imported by path?) - put the module on `$env:PSModulePath, or list the function in -SharedFunctionNames") })
             }
         }
 
@@ -1814,6 +1862,11 @@ function Test-PkWorkerSafety {
         # { }.GetNewClosure()) anywhere in this code, then passed as
         # $lazy = [System.Lazy[object]]::new($factory). By name, not by flow:
         # a variable reassigned to something else in between is still flagged.
+        # Methods that only store a value in a collection ($list.Add($sb),
+        # $map.Add($k, $sb), $queue.Enqueue($sb)) aren't flagged: storing a
+        # scriptblock makes no delegate. Not caught as a result: a collection
+        # typed to hold delegates (List[Func[object]]), where .Add converts.
+        $storageMethods = @('Add', 'AddRange', 'Insert', 'Enqueue', 'Push', 'TryAdd', 'Contains', 'Remove', 'IndexOf', 'set_Item')
         $scriptBlockVars = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($assign in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
             $target = $assign.Left
@@ -1829,6 +1882,7 @@ function Test-PkWorkerSafety {
             if ($null -eq $call.Arguments) { continue }
             $memberName = [string]$call.Member.Extent.Text
             if ($memberName -in @('ForEach', 'Where')) { continue }
+            if ($memberName -in $storageMethods) { continue }
             $passed = $null
             foreach ($argument in $call.Arguments) {
                 if ($argument -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $passed = 'a scriptblock' }
