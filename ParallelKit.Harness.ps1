@@ -43,6 +43,9 @@ function New-JobList {
 }
 
 $cmdExe  = Join-Path $env:SystemRoot "System32\cmd.exe"
+# Whichever PowerShell is running the harness (powershell.exe or pwsh.exe),
+# for the tests that need a fresh process of the same version.
+$selfExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $pingExe = Join-Path $env:SystemRoot "System32\ping.exe"
 
 # A user function the workers share.
@@ -681,7 +684,7 @@ $kitPath = Join-Path $PSScriptRoot "ParallelKit.ps1"
 [System.Threading.ThreadPool]::GetMinThreads([ref]`$w, [ref]`$io)
 Write-Output ("before=" + `$before + " after=" + [PkChildProcessJob]::IsInitialized + " threads=" + `$w)
 "@)
-$probe = Invoke-PkProcessWithTimeout -FilePath (Join-Path $PSHOME "powershell.exe") -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $probeScript + '"') -TimeoutMs 60000
+$probe = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $probeScript + '"') -TimeoutMs 60000
 [System.IO.File]::Delete($probeScript)
 Test-Assert ($probe.Stdout -match 'before=False after=True') ("starting a process sets up child cleanup by itself (" + ([string]$probe.Stdout).Trim() + ")")
 $probeThreads = 0
@@ -973,7 +976,7 @@ $staleScript = Join-Path $env:TEMP ("pk-stale-" + [guid]::NewGuid().ToString("N"
 Add-Type -TypeDefinition 'public static class PkConsoleCtrl { } public static class PkState { }'
 try { . '$kitPath'; Write-Output 'LOADED' } catch { Write-Output ('REFUSED: ' + `$_) }
 "@)
-$stale = Invoke-PkProcessWithTimeout -FilePath (Join-Path $PSHOME "powershell.exe") -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $staleScript + '"') -TimeoutMs 60000
+$stale = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $staleScript + '"') -TimeoutMs 60000
 [System.IO.File]::Delete($staleScript)
 Test-Assert ($stale.Stdout -like '*REFUSED:*older version of the kit*start a new one*') "loading the kit over an older copy's types is refused with a clear message"
 
