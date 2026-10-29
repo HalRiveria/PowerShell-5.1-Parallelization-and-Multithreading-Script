@@ -322,7 +322,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.
 - `Invoke-PkProcessDispatch` has no per-program time limit (`Invoke-PkProcessBatch` has `-TimeoutSeconds`): a program that hangs holds its slot until it exits or the run is aborted. You can add one through `-JobPollCompleted`, using the stopwatch the default starter puts on each job: `{ param($job) if ($job['Stopwatch'].Elapsed.TotalMinutes -gt 10) { $null = Stop-PkProcessTree -Process $job['Proc'] }; $job['Proc'].HasExited }`. The killed job then goes through `-JobFinalize` like any other, with a non-zero exit code.
 - Programs run hidden, and there's no way to send them input. A program that stops to ask a question will sit there until it's killed.
-- A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory.
+- A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory. A batch keeps every result, output included, until it returns, which adds up over thousands of chatty programs. If you only need the output in `-OnComplete`, drop it there with `$result.Stdout = $null; $result.Stderr = $null` and it's freed as the batch goes.
 
 ## Testing
 
