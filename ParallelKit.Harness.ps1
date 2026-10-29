@@ -13,6 +13,11 @@ Set-StrictMode -Version Latest
 
 $script:passCount = 0
 $script:failCount = 0
+$script:skipCount = 0
+# A few checks need things only some machines have (a console of their own,
+# say). Where they can't run they print [SKIP] with the reason. Set
+# PK_HARNESS_NO_SKIP=1 to count every skip as a failure instead.
+$script:noSkip = ($env:PK_HARNESS_NO_SKIP -eq '1')
 
 function Test-Assert {
     param([bool]$Condition, [string]$Message)
@@ -22,6 +27,17 @@ function Test-Assert {
     } else {
         $script:failCount++
         Write-Host ("  [FAIL] " + $Message) -ForegroundColor Red
+    }
+}
+
+function Test-Skip {
+    param([string]$Message)
+    if ($script:noSkip) {
+        $script:failCount++
+        Write-Host ("  [FAIL] " + $Message + " (skipping isn't allowed: PK_HARNESS_NO_SKIP=1)") -ForegroundColor Red
+    } else {
+        $script:skipCount++
+        Write-Host ("  [SKIP] " + $Message) -ForegroundColor Yellow
     }
 }
 
@@ -1494,14 +1510,298 @@ Test-Assert ($parked.AfterDrain -eq $false -and [PkConsoleCtrl]::DrainComplete.I
 Reset-PkAbortState
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== V: real console events (Ctrl+C, Ctrl+Break, window close) ===" -ForegroundColor Cyan
+# Everything above fakes the abort flags. Here Windows itself calls the kit's
+# handler. Each scenario runs a child PowerShell in a console of its own (a
+# hidden window), and the events go to that console only: Ctrl+C/Ctrl+Break
+# from a helper process that attaches to it, a close as WM_CLOSE to its
+# window. Nothing is ever sent to the console this harness runs in.
+#
+# The child also registers a probe handler after the kit's, so Windows calls
+# it first. If the probe never saw the first event, Windows didn't deliver
+# it, and the scenario is skipped rather than blamed on the kit.
+
+if (-not ([System.Management.Automation.PSTypeName]'PkHarnessWin').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PkHarnessWin {
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+}
+'@
+}
+
+$consoleDir = Join-Path $env:TEMP ("pk-harness-console-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path $consoleDir
+$childScript  = Join-Path $consoleDir 'child.ps1'
+$senderScript = Join-Path $consoleDir 'sender.ps1'
+
+# Logs are "<UTC ticks> <text>" lines, so times compare across processes.
+[System.IO.File]::WriteAllText($childScript, @'
+param([string]$KitPath, [string]$LogFile, [string]$Mode, [int]$AbortTimeoutSeconds)
+Set-StrictMode -Version Latest
+$global:PkChildLog = $LogFile
+function global:Write-ChildLog([string]$Message) { [System.IO.File]::AppendAllText($global:PkChildLog, ([DateTime]::UtcNow.Ticks.ToString() + " " + $Message + "`r`n")) }
+Write-ChildLog "started"
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+public static class PkHarnessProbe {
+    public delegate bool HandlerRoutine(uint ctrlType);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
+    [DllImport("kernel32.dll", EntryPoint = "SetConsoleCtrlHandler", SetLastError = true)] public static extern bool SetIgnoreCtrlC(IntPtr none, bool ignore);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    private static HandlerRoutine _h;
+    private static string _path;
+    public static bool Register(string path) { _path = path; _h = new HandlerRoutine(H); return SetConsoleCtrlHandler(_h, true); }
+    private static bool H(uint t) {
+        try { File.AppendAllText(_path, DateTime.UtcNow.Ticks.ToString() + " event " + t + "\r\n"); } catch { }
+        return false;
+    }
+}
+"@
+# A process started from a tool may inherit "ignore Ctrl+C"; a user's console doesn't.
+$null = [PkHarnessProbe]::SetIgnoreCtrlC([IntPtr]::Zero, $false)
+$hwnd = [int64][PkHarnessProbe]::GetConsoleWindow()
+. $KitPath
+$null = Initialize-ParallelKit
+$null = [PkHarnessProbe]::Register($LogFile + ".events")
+Set-PkMessageHandler { param($Message, $Level) Write-ChildLog ("kit " + $Message) }
+Write-ChildLog ("hwnd " + $hwnd)
+if ($Mode -eq "run") {
+    $ping = Join-Path $env:SystemRoot "System32\ping.exe"
+    $feed = @{ Given = $false }
+    $params = @{
+        GroupProvider       = { if ($feed.Given) { return $null }; $feed.Given = $true; return "g" }.GetNewClosure()
+        JobBuilder          = { param($g) return @(@{ FilePath = $ping; Arguments = "-n 60 127.0.0.1"; N = 1 }, @{ FilePath = $ping; Arguments = "-n 60 127.0.0.1"; N = 2 }) }.GetNewClosure()
+        JobFinalize         = { param($job, $pending) $null = Complete-PkProcess -Job $job }
+        JobAbortCleanup     = { param($job) Write-ChildLog ("cleanup " + $job["N"]) }
+        MaxConcurrent       = 2
+        AbortTimeoutSeconds = $AbortTimeoutSeconds
+    }
+    Write-ChildLog "ready"
+    $r = Invoke-PkRun { Invoke-PkProcessDispatch @params }.GetNewClosure()
+    Write-ChildLog ("returned Aborted=" + $r.Aborted + " ForceKilledCount=" + $r.ForceKilledCount)
+}
+Write-ChildLog "idle"
+foreach ($i in 1..60) { Start-Sleep -Seconds 1 }
+Write-ChildLog "END"
+'@)
+
+[System.IO.File]::WriteAllText($senderScript, @'
+param([int]$TargetPid, [int]$EventType, [string]$LogFile)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class PkHarnessSender {
+    public delegate bool HandlerRoutine(uint ctrlType);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(HandlerRoutine h, bool add);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint ev, uint group);
+    private static HandlerRoutine _swallow = new HandlerRoutine(Swallow);
+    private static bool Swallow(uint ctrlType) { return true; }
+    public static string Send(uint pid, uint ev) {
+        FreeConsole();
+        if (!AttachConsole(pid)) { return "attach-failed " + Marshal.GetLastWin32Error(); }
+        // This helper is attached to the same console, so it gets the event
+        // too. A handler, not the ignore-Ctrl+C flag: that doesn't cover Ctrl+Break.
+        SetConsoleCtrlHandler(_swallow, true);
+        long at = DateTime.UtcNow.Ticks;
+        if (!GenerateConsoleCtrlEvent(ev, 0)) { return "send-failed " + Marshal.GetLastWin32Error(); }
+        System.Threading.Thread.Sleep(300);
+        FreeConsole();
+        return "sent " + at;
+    }
+}
+"@
+$result = [PkHarnessSender]::Send([uint32]$TargetPid, [uint32]$EventType)
+[System.IO.File]::AppendAllText($LogFile, ($result + "`r`n"))
+'@)
+
+function Read-HarnessLines {
+    # The child may be writing; open for reading without locking it out.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { $text = [System.IO.StreamReader]::new($fs).ReadToEnd() } finally { $fs.Dispose() }
+    } catch { return @() }   # caught mid-write; the next poll reads it
+    return @($text -split "`r`n" | Where-Object { $_ -ne '' })
+}
+
+function Get-HarnessLogTicks {
+    # The time of the first line whose text matches, or 0.
+    param([object[]]$Lines, [string]$Pattern)
+    foreach ($l in $Lines) {
+        $sp = $l.IndexOf(' ')
+        if ($sp -gt 0 -and $l.Substring($sp + 1) -like $Pattern) { return [int64]$l.Substring(0, $sp) }
+    }
+    return [int64]0
+}
+
+$hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$kitPath = Join-Path $PSScriptRoot "ParallelKit.ps1"
+# Events: C = Ctrl+C, B = Ctrl+Break, X = window close. At = seconds after the
+# child logs "ready" (or "idle" when there's no run), or 'idle' = just after
+# the run has returned. WaitFor = what ends the scenario.
+$scenarios = @(
+    @{ Name = 'ctrlc';       Mode = 'run';   Timeout = 3;  Events = @(@{ Kind = 'C'; At = 1.5 }, @{ Kind = 'C'; At = 'idle' }); WaitFor = 'exit' }
+    @{ Name = 'break';       Mode = 'run';   Timeout = 3;  Events = @(@{ Kind = 'B'; At = 1.5 });                              WaitFor = 'idle' }
+    @{ Name = 'norun';       Mode = 'norun'; Timeout = 3;  Events = @(@{ Kind = 'C'; At = 0.5 });                              WaitFor = 'exit' }
+    @{ Name = 'close';       Mode = 'run';   Timeout = 20; Events = @(@{ Kind = 'X'; At = 1.5 });                              WaitFor = 'exit' }
+    @{ Name = 'ctrlc-close'; Mode = 'run';   Timeout = 20; Events = @(@{ Kind = 'C'; At = 1.5 }, @{ Kind = 'X'; At = 4.0 });   WaitFor = 'exit' }
+    @{ Name = 'ctrlc-twice'; Mode = 'run';   Timeout = 20; Events = @(@{ Kind = 'C'; At = 1.5 }, @{ Kind = 'C'; At = 4.0 });   WaitFor = 'idle' }
+)
+foreach ($s in $scenarios) {
+    $s.Log = Join-Path $consoleDir ($s.Name + '.log')
+    $s.SendLog = Join-Path $consoleDir ($s.Name + '.send.log')
+    $s.Next = 0; $s.LastEventAt = [int64]0; $s.Sent = [System.Collections.Generic.List[hashtable]]::new(); $s.Done = $false; $s.Killed = $false; $s.Skip = $null
+    $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $childScript + '"'), '-KitPath', ('"' + $kitPath + '"'), '-LogFile', ('"' + $s.Log + '"'), '-Mode', $s.Mode, '-AbortTimeoutSeconds', $s.Timeout)
+    # No -NoNewWindow: the child gets a console of its own.
+    $s.Child = Start-Process -FilePath $hostExe -ArgumentList $childArgs -WindowStyle Hidden -PassThru
+    $s.Launched = [DateTime]::UtcNow.Ticks
+}
+
+$overall = [System.Diagnostics.Stopwatch]::StartNew()
+try {
+    while ($overall.Elapsed.TotalSeconds -lt 90 -and @($scenarios | Where-Object { -not $_.Done }).Count -gt 0) {
+        $now = [DateTime]::UtcNow.Ticks
+        foreach ($s in $scenarios) {
+            if ($s.Done) { continue }
+            $lines = @(Read-HarnessLines -Path $s.Log)
+            if ((Get-HarnessLogTicks $lines 'started') -eq 0) {
+                if (($now - $s.Launched) / 1e7 -gt 30) { $s.Skip = "the child PowerShell never started in a console of its own"; $s.Done = $true }
+                continue
+            }
+            $baseLine = 'ready'
+            if ($s.Mode -eq 'norun') { $baseLine = 'idle' }
+            $base = Get-HarnessLogTicks $lines $baseLine
+            $idle = Get-HarnessLogTicks $lines 'idle'
+            if ($base -eq 0) {
+                if (($now - $s.Launched) / 1e7 -gt 45 -or $s.Child.HasExited) { $s.Done = $true }   # judged below as a failure
+                continue
+            }
+            if ($s.Next -lt $s.Events.Count) {
+                $e = $s.Events[$s.Next]
+                $due = $false
+                if ($e.At -is [string]) { $due = ($idle -ne 0 -and ($now - $idle) / 1e7 -ge 0.5) }
+                else { $due = (($now - $base) / 1e7 -ge [double]$e.At) }
+                if ($due -and -not $s.Child.HasExited) {
+                    if ($e.Kind -eq 'X') {
+                        $hwndLine = @($lines | Where-Object { $_ -like '* hwnd *' })[0]
+                        $hwnd = [int64]($hwndLine.Substring($hwndLine.LastIndexOf(' ') + 1))
+                        if ($hwnd -eq 0) { $s.Skip = "the child's console has no window to close"; $s.Done = $true; continue }
+                        $posted = [PkHarnessWin]::PostMessage([IntPtr]$hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE
+                        $s.Sent.Add(@{ Kind = 'X'; Ticks = [DateTime]::UtcNow.Ticks; Ok = $posted })
+                    } else {
+                        $evType = 0
+                        if ($e.Kind -eq 'B') { $evType = 1 }
+                        $sendArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $senderScript + '"'), '-TargetPid', $s.Child.Id, '-EventType', $evType, '-LogFile', ('"' + $s.SendLog + '"'))
+                        $null = Start-Process -FilePath $hostExe -ArgumentList $sendArgs -WindowStyle Hidden -PassThru
+                        $s.Sent.Add(@{ Kind = $e.Kind; Ticks = 0; Ok = $true })
+                    }
+                    $s.Next++
+                    $s.LastEventAt = [DateTime]::UtcNow.Ticks
+                }
+            } else {
+                $finished = $s.Child.HasExited
+                if ($s.WaitFor -eq 'idle' -and $idle -ne 0) { $finished = $true }
+                if ($finished -or ($now - $s.LastEventAt) / 1e7 -gt 12) { $s.Done = $true }
+            }
+        }
+        [System.Threading.Thread]::Sleep(50)
+    }
+} finally {
+    # Senders finish within a second of sending; give the last ones time to log.
+    [System.Threading.Thread]::Sleep(1500)
+    foreach ($s in $scenarios) {
+        if (-not $s.Child.HasExited) {
+            $s.Killed = $true
+            foreach ($k in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $s.Child.Id))) { Stop-Process -Id $k.ProcessId -Force -ErrorAction SilentlyContinue }
+            Stop-Process -Id $s.Child.Id -Force -ErrorAction SilentlyContinue
+            $null = $s.Child.WaitForExit(5000)
+        }
+    }
+}
+
+foreach ($s in $scenarios) {
+    $label = "real " + $s.Name + ": "
+    if ($null -ne $s.Skip) { Test-Skip ($label + $s.Skip); continue }
+    $lines  = @(Read-HarnessLines -Path $s.Log)
+    $events = @(Read-HarnessLines -Path ($s.Log + '.events'))
+    $sends  = @(Read-HarnessLines -Path $s.SendLog)
+    $baseLine = 'ready'
+    if ($s.Mode -eq 'norun') { $baseLine = 'idle' }
+    if ((Get-HarnessLogTicks $lines $baseLine) -eq 0) {
+        Test-Assert $false ($label + "the child loaded the kit and started (log: " + (@($lines | Select-Object -Last 3) -join ' | ') + ")")
+        continue
+    }
+    # Fill in when each Ctrl+C/Ctrl+Break was really sent, from the senders' logs.
+    $keySends = @($s.Sent | Where-Object { $_.Kind -ne 'X' })
+    $failedSend = @($sends | Where-Object { $_ -notlike 'sent *' })
+    if ($failedSend.Count -gt 0) { Test-Skip ($label + "couldn't send the console event (" + ($failedSend -join ', ') + ")"); continue }
+    $sentTicks = @($sends | ForEach-Object { [int64]$_.Substring(5) } | Sort-Object)
+    if ($sentTicks.Count -lt $keySends.Count) { Test-Skip ($label + "a helper that sends Ctrl+C never reported back (" + $sentTicks.Count + " of " + $keySends.Count + ")"); continue }
+    for ($i = 0; $i -lt $keySends.Count; $i++) { $keySends[$i].Ticks = $sentTicks[$i] }
+    if (@($s.Sent | Where-Object { -not $_.Ok }).Count -gt 0) { Test-Skip ($label + "posting WM_CLOSE to the child's console failed"); continue }
+    # Only the first event says anything about the machine: a later one that
+    # never arrives is what a handler holding events back looks like.
+    if ($events.Count -eq 0) { Test-Skip ($label + "Windows didn't deliver the console event to the child"); continue }
+
+    $text = @($lines | ForEach-Object { $_.Substring($_.IndexOf(' ') + 1) })
+    $has = { param($p) @($text | Where-Object { $_ -like $p }).Count -gt 0 }
+    $cleanups = @($text | Where-Object { $_ -like 'cleanup *' }).Count
+    $returnedTicks = Get-HarnessLogTicks $lines 'returned *'
+    $exitTicks = [int64]0
+    if (-not $s.Killed) { $exitTicks = $s.Child.ExitTime.ToUniversalTime().Ticks }
+    $lastSent = $s.Sent[$s.Sent.Count - 1].Ticks
+    $exitAfter = -1.0
+    if ($exitTicks -ne 0) { $exitAfter = [math]::Round(($exitTicks - $lastSent) / 1e7, 2) }
+
+    switch ($s.Name) {
+        'ctrlc' {
+            Test-Assert ((& $has 'kit *Ctrl+C detected*') -and (& $has 'returned Aborted=True ForceKilledCount=2') -and $cleanups -eq 2) ($label + "Ctrl+C in a run aborts it, cleans up both programs and the script carries on (cleanups: " + $cleanups + ")")
+            Test-Assert ($exitAfter -ge 0 -and $exitAfter -lt 4 -and -not (& $has 'END')) ($label + "Ctrl+C after the run has ended stops the script as usual (exited " + $exitAfter + "s after the press)")
+        }
+        'break' {
+            Test-Assert ((& $has 'kit *Ctrl+Break detected*') -and (& $has 'returned Aborted=True ForceKilledCount=2') -and $cleanups -eq 2) ($label + "Ctrl+Break in a run aborts it like Ctrl+C (cleanups: " + $cleanups + ")")
+        }
+        'norun' {
+            Test-Assert ($exitAfter -ge 0 -and $exitAfter -lt 4) ($label + "with no run active, Ctrl+C stops the script as usual (exited " + $exitAfter + "s after the press)")
+        }
+        'close' {
+            Test-Assert ((& $has 'kit *Window close detected*') -and $cleanups -eq 2 -and $exitAfter -ge 0 -and $exitAfter -lt 5.5) ($label + "closing the window stops the jobs, cleans up both and the process ends (cleanups: " + $cleanups + ", exited " + $exitAfter + "s after the close)")
+        }
+        'ctrlc-close' {
+            $closeSeen = [int64]0
+            foreach ($l in $events) { if ($l -like '* event 2') { $closeSeen = [int64]$l.Substring(0, $l.IndexOf(' ')) } }
+            $closeDelay = -1.0
+            if ($closeSeen -ne 0) { $closeDelay = [math]::Round(($closeSeen - $lastSent) / 1e7, 2) }
+            Test-Assert ($closeDelay -ge 0 -and $closeDelay -lt 1 -and $cleanups -eq 2 -and (& $has 'kit *now: the window is closing*')) ($label + "a window close after Ctrl+C gets through at once and still cleans up (close seen " + $closeDelay + "s after it was sent, cleanups: " + $cleanups + ")")
+        }
+        'ctrlc-twice' {
+            $cutShort = -1.0
+            if ($returnedTicks -ne 0) { $cutShort = [math]::Round(($returnedTicks - $lastSent) / 1e7, 2) }
+            Test-Assert ((& $has 'kit *now: Ctrl+C was pressed again*') -and (& $has 'returned Aborted=True ForceKilledCount=2') -and $cutShort -ge 0 -and $cutShort -lt 3 -and (& $has 'idle')) ($label + "a second Ctrl+C skips the 20s drain and the script carries on (run returned " + $cutShort + "s after the 2nd press)")
+        }
+    }
+}
+Remove-Item -LiteralPath $consoleDir -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
 Write-Host "==============================================="
+$skipText = ""
+if ($script:skipCount -gt 0) { $skipText = ", " + $script:skipCount + " skipped" }
 if ($script:failCount -eq 0) {
-    Write-Host ("ALL PASSED  (" + $script:passCount + " assertions)") -ForegroundColor Green
+    Write-Host ("ALL PASSED  (" + $script:passCount + " assertions" + $skipText + ")") -ForegroundColor Green
 } else {
-    Write-Host ($script:failCount.ToString() + " FAILED, " + $script:passCount + " passed") -ForegroundColor Red
+    Write-Host ($script:failCount.ToString() + " FAILED, " + $script:passCount + " passed" + $skipText) -ForegroundColor Red
 }
 Write-Host "==============================================="
 

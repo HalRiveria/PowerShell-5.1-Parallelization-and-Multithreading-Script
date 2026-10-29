@@ -318,7 +318,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 powershell -NoProfile -File .\ParallelKit.Harness.ps1
 ```
 
-It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
+It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
 GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`.
 
