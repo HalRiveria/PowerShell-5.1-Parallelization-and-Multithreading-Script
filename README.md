@@ -95,9 +95,9 @@ It works whether or not your script uses `Set-StrictMode`.
 
 The version is in the comment block at the top of the file, so a copy kept in your project still says which one it is. That block also carries the licence notice; keep it with the file.
 
-Dot-source it; don't `Import-Module` it. As a module it couldn't see the functions you list in `-SharedFunctionNames`.
+Dot-source it. It loads itself as an in-memory module named `ParallelKit`: nothing is installed and nothing goes on `$env:PSModulePath`, but `Get-Module` lists it while it's loaded. Dot-sourcing it again replaces the copy already loaded.
 
-The kit's functions are also defined globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started.
+Its public functions are imported globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started. Its internal helpers stay inside the module.
 
 `Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
 
@@ -125,7 +125,7 @@ Long parameter lists in these examples use splatting (`@batchParams`) instead of
 
 Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
 
-Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
+Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A drive you make with `New-PSDrive` inside a function is visible only to that function, so make it with `-Scope Script` (or `Global`) if the kit should use it. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
 
 `Invoke-PkProcessBatch` returns an object with `Results`, `Aborted` and `ForceKilledCount`. Each result is an object with `Command`, `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut`, `StreamError`, `StartError`, `Aborted` and `TimedOut`, every field always present, so `$batch.Results | Format-Table` reads well:
 
@@ -254,7 +254,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
 - Returns an object with `GroupResults`, `Aborted`, `ForceKilledCount` and `JobStarterFailedCount`. `GroupResults` holds one object with `GroupInfo`, `Completed` and `Aborted` per group, where `GroupInfo` is the group value.
 
-Closures: build every callback that uses your local variables with `{ ... }.GetNewClosure()`. Without it, a variable name that happens to match one inside the kit silently reads the kit's value instead of yours. And keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a closure doesn't stick between calls. A closure can't see functions your script defines when the script is run from a prompt (`.\script.ps1`); the kit's own functions always work, but define any of yours that a closure calls as `function global:Get-Thing { ... }`.
+Callbacks: a plain `{ ... }` callback sees your variables and functions from where you called the kit, never the kit's own internals, so `.GetNewClosure()` isn't needed for that. The one exception is a callback you give to an engine inside a worker runspace (a dispatcher per runspace job, say): there, build it with `.GetNewClosure()`, or a variable name that matches one inside the kit reads the kit's value instead of yours. Either way, keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a callback doesn't stick between calls. A `.GetNewClosure()` block can't see functions your script defines when the script is run from a prompt (`.\script.ps1`); the kit's own functions always work, but define any of yours that a closure calls as `function global:Get-Thing { ... }`.
 
 ## Single processes
 
@@ -301,9 +301,6 @@ Three things to know:
 - **Your script carries on after an abort.** The engines return with `Aborted = $true` and the rest of your script runs. If an abort should end it, say so: `if ($batch.Aborted) { exit 1 }`.
 
 `Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
-
-The block you give `Invoke-PkRun` runs inside it, so a variable of yours named like one of its own (`$ScriptBlock`, `$KeepAwake`, `$DisableQuickEdit`) reads its value instead of yours. Add `.GetNewClosure()` to the block if that could happen.
-
 Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
 
 ## Choosing limits
@@ -354,9 +351,9 @@ PowerShell 7 on Windows, yes: Windows PowerShell 5.1 is the main target, but the
 
 No. Nothing it does needs elevation.
 
-**Why a file to dot-source instead of a module?**
+**Is it a module?**
 
-As a module it couldn't find the functions you list in `-SharedFunctionNames`, since a module has its own scope. It's also one file you can copy into a project and keep at a known version, with nothing to install on machines where installing modules isn't allowed.
+It is. Dot-sourcing the file loads it as an in-memory module, so there's nothing to install and nothing on `$env:PSModulePath`. The functions you list in `-SharedFunctionNames` are found from wherever you call the kit: a script's own functions, functions inside a function, or a module's private functions. You keep one file at a known version, which you can copy into a project even on machines where installing modules isn't allowed.
 
 **What happens to running programs when I press Ctrl+C?**
 
@@ -380,7 +377,7 @@ No. The engines take a list of hashtables (`-Commands`, `-JobParams`) rather tha
 
 **Which functions are meant to be used?**
 
-The ones in this README: the engines, the [single-process functions](#single-processes), and the abort and message functions named in their sections. Dot-sourcing also brings in internal helpers (`Invoke-PkProcessDispatchCore`, `Get-PkCommandKind` and so on), which show up in tab completion. Those can change between versions; don't call them.
+The ones in this README: the engines, the [single-process functions](#single-processes), and the abort and message functions named in their sections. Everything else is an internal helper that stays inside the module and can change between versions.
 
 **Does a program I start get my Ctrl+C too?**
 
