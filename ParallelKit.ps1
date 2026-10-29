@@ -765,12 +765,14 @@ function Start-PkProcess {
     # Pass what this returns to Wait-PkProcess and Complete-PkProcess. Throws if the
     # program can't be started.
     # .PARAMETER FilePath
-    # The program to run.
+    # The program to run. A path with a folder in it (.\tool.exe, bin\tool.exe) is
+    # relative to your current location. A bare name (tool.exe) is found the way
+    # Windows finds programs, mostly on PATH.
     # .PARAMETER Arguments
     # Its command line as one string (see ConvertTo-PkArgumentString).
     # .PARAMETER WorkingDirectory
-    # Where to run it. Default: the PowerShell process's working directory, which
-    # isn't always your current location.
+    # Where to run it. Default: your current location. A relative path is relative
+    # to your current location too.
     # .PARAMETER OutputEncoding
     # How to decode its output: a name like 'utf-8', a code page number, or a
     # [System.Text.Encoding]. Default: the console's code page.
@@ -801,12 +803,33 @@ function Start-PkProcess {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $psi.CreateNoWindow         = $true
-    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+
+    # Relative paths mean your current location, as everywhere else in
+    # PowerShell, not the process's working directory (which cd and
+    # Set-Location never change). From a location that isn't on disk (HKLM:,
+    # say) that's the last file-system one. If that folder is gone, fall back
+    # to the process's working directory, as before.
+    $here = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    if (-not [System.IO.Directory]::Exists($here)) { $here = $null }
 
     # In a try/catch on purpose: a bare .NET call that throws does not
     # reliably stop a PowerShell script, and a $null process left behind
-    # would be polled forever.
+    # would be polled forever. The path handling is in here too: it throws
+    # on a path with characters Windows doesn't allow.
     try {
+        if ($WorkingDirectory) {
+            if ($null -ne $here -and -not [System.IO.Path]::IsPathRooted($WorkingDirectory)) {
+                $WorkingDirectory = [System.IO.Path]::Combine($here, $WorkingDirectory)
+            }
+            $psi.WorkingDirectory = $WorkingDirectory
+        } elseif ($null -ne $here) {
+            $psi.WorkingDirectory = $here
+        }
+        # Only a path with a folder in it: a bare name is left to Windows'
+        # own search, which looks on PATH.
+        if ($null -ne $here -and -not [System.IO.Path]::IsPathRooted($FilePath) -and ($FilePath.Contains('\') -or $FilePath.Contains('/'))) {
+            $psi.FileName = [System.IO.Path]::Combine($here, $FilePath)
+        }
         $proc = [System.Diagnostics.Process]::Start($psi)
     } catch {
         throw ("Start-PkProcess: could not start '" + $FilePath + "': " + $_)
@@ -965,7 +988,7 @@ function Invoke-PkProcessWithTimeout {
     # .PARAMETER StreamTimeoutMs
     # How long to wait for the output after the program exits (default 15000).
     # .PARAMETER WorkingDirectory
-    # Where to run it, as for Start-PkProcess.
+    # Where to run it, as for Start-PkProcess. Default: your current location.
     # .PARAMETER OutputEncoding
     # How to decode its output, as for Start-PkProcess.
     # .PARAMETER IgnoreAbort
