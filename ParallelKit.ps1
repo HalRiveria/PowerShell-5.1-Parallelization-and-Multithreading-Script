@@ -1207,6 +1207,39 @@ function Invoke-PkProcessDispatch {
     }
 }
 
+function Add-PkDispatchGroupJobs {
+    # Builds one group's jobs, tags them with the group and queues them.
+    # Returns how many were queued. Its own function, not inline in the
+    # dispatch loop, so the group's job list dies with this call: kept in the
+    # loop's frame it stayed alive for the whole run (nulling the variables
+    # wasn't enough once PowerShell had compiled the loop), and with it every
+    # finished job's output, even output the caller had already dropped.
+    param(
+        [Parameter(Mandatory)][scriptblock]$JobBuilder,
+        $GroupInfo,
+        [Parameter(Mandatory)][object]$GroupKey,
+        [Parameter(Mandatory)][System.Collections.Generic.Queue[hashtable]]$Pending
+    )
+    $rawJobs = & $JobBuilder $GroupInfo
+    # Assigned inside each branch, NOT `$jobs = if (...) {...} else {...}`:
+    # captured through an if/else, a single hashtable gets
+    # enumerated into its key/value pairs.
+    if ($null -eq $rawJobs) { $rawJobList = @() } else { $rawJobList = @($rawJobs) }
+    # Keep only real job hashtables: a builder that lets a stray
+    # value escape (a HashSet.Add's True, say) must not crash the run.
+    $jobs = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($rawJob in $rawJobList) { if ($rawJob -is [hashtable]) { $jobs.Add($rawJob) } }
+    if ($jobs.Count -ne $rawJobList.Count) {
+        Write-PkMessage ("ProcessDispatch: -JobBuilder returned " + ($rawJobList.Count - $jobs.Count) + " value(s) that are not job hashtables - ignored. Each job must be a hashtable.") -Level Warn
+    }
+    foreach ($j in $jobs) {
+        $j['GroupKey'] = $GroupKey
+        if (-not $j.ContainsKey('Group')) { $j['Group'] = $GroupInfo }   # leave a job's own 'Group' field alone
+        $Pending.Enqueue($j)
+    }
+    return $jobs.Count
+}
+
 function Invoke-PkProcessDispatchCore {
     # The dispatch loop itself. Call Invoke-PkProcessDispatch, not this.
     param(
@@ -1263,24 +1296,8 @@ function Invoke-PkProcessDispatchCore {
             # share one job count. Jobs carry this key as .GroupKey and the
             # group value itself as .Group.
             $groupKey = [object]::new()
-            $rawJobs = & $JobBuilder $groupInfo
-            # Assigned inside each branch, NOT `$jobs = if (...) {...} else {...}`:
-            # captured through an if/else, a single hashtable gets
-            # enumerated into its key/value pairs.
-            if ($null -eq $rawJobs) { $rawJobList = @() } else { $rawJobList = @($rawJobs) }
-            # Keep only real job hashtables: a builder that lets a stray
-            # value escape (a HashSet.Add's True, say) must not crash the run.
-            $jobs = [System.Collections.Generic.List[hashtable]]::new()
-            foreach ($rawJob in $rawJobList) { if ($rawJob -is [hashtable]) { $jobs.Add($rawJob) } }
-            if ($jobs.Count -ne $rawJobList.Count) {
-                Write-PkMessage ("ProcessDispatch: -JobBuilder returned " + ($rawJobList.Count - $jobs.Count) + " value(s) that are not job hashtables - ignored. Each job must be a hashtable.") -Level Warn
-            }
-            foreach ($j in $jobs) {
-                $j['GroupKey'] = $groupKey
-                if (-not $j.ContainsKey('Group')) { $j['Group'] = $groupInfo }   # leave a job's own 'Group' field alone
-                $pending.Enqueue($j)
-            }
-            $state = @{ GroupInfo = $groupInfo; Outstanding = $jobs.Count; Completed = $false }
+            $jobCount = Add-PkDispatchGroupJobs -JobBuilder $JobBuilder -GroupInfo $groupInfo -GroupKey $groupKey -Pending $pending
+            $state = @{ GroupInfo = $groupInfo; Outstanding = $jobCount; Completed = $false }
             $groupStates[$groupKey] = $state
             $activeGroupCount++
             if ($state.Outstanding -le 0) {
@@ -1727,7 +1744,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs')
 }
 
 function Get-PkHandlerParamCount {
