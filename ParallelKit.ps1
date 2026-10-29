@@ -1,7 +1,7 @@
 # ParallelKit - parallel runspace jobs, bounded external-process dispatch, and
 # graceful Ctrl+C/window-close handling for Windows PowerShell 5.1.
 #
-# Version 2.0 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 2.1 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
