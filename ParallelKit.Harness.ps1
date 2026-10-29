@@ -1813,6 +1813,87 @@ foreach ($s in $scenarios) {
 }
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== W: relative paths and the current location ===" -ForegroundColor Cyan
+# Programs start in the caller's current location, which cd/Set-Location
+# change but the process's working directory doesn't follow.
+Reset-Harness
+$here = Join-Path $env:TEMP ("pk-harness-wd-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $here 'sub')
+[System.IO.File]::WriteAllText((Join-Path $here 'pk-wd.cmd'), "@echo pk-wd ran in %CD%`r`n")
+$gone = Join-Path $env:TEMP ("pk-harness-wd-gone-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path $gone
+function Get-HarnessCd {
+    # Where a program started by each entry point runs, via "cmd /c cd".
+    $wd = @{}
+    $wd.Batch = (Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd' })).Results[0].Stdout.Trim()
+    $wd.WithTimeout = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim()
+    $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd'
+    $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
+    $wd.StartProcess = (Complete-PkProcess -Job $started -Dispose $true).Stdout.Trim()
+    $out = @{ Text = $null }
+    $feed = @{ Given = $false }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c cd' }) }.GetNewClosure() `
+        -JobFinalize { param($job, $pending) $out.Text = (Complete-PkProcess -Job $job).Stdout.Trim() }.GetNewClosure()
+    $wd.Dispatch = $out.Text
+    return $wd
+}
+Push-Location -LiteralPath $here
+# %TEMP% can be an 8.3 short path (C:\Users\RUNNER~1\... on GitHub's
+# runners); compare against the folder as PowerShell reports it.
+$here = (Get-Location).ProviderPath
+try {
+    Test-Assert ([Environment]::CurrentDirectory -ne $here) ("precondition: the process's working directory isn't the test folder (" + [Environment]::CurrentDirectory + ")")
+    $wd = Get-HarnessCd
+    $wrong = @($wd.Keys | Where-Object { $wd[$_] -ine $here })
+    Test-Assert ($wrong.Count -eq 0) ("every entry point starts programs in the current location by default (wrong: " + (@($wrong | ForEach-Object { $_ + '=' + $wd[$_] }) -join ', ') + ")")
+
+    $relText = $null
+    try { $relText = (Invoke-PkProcessWithTimeout -FilePath '.\pk-wd.cmd').Stdout.Trim() } catch { $relText = [string]$_ }
+    $missingText = ''
+    try { $null = Invoke-PkProcessWithTimeout -FilePath '.\no-such-tool.exe' } catch { $missingText = [string]$_ }
+    Test-Assert ($missingText -like ("*'.\no-such-tool.exe' (" + (Join-Path $here 'no-such-tool.exe') + ")*")) ("a program that can't be started is named with the full path that was tried (" + $missingText + ")")
+    $relBatch = (Invoke-PkProcessBatch -Commands @(@{ FilePath = '.\pk-wd.cmd' })).Results[0]
+    Test-Assert ($relText -ieq ("pk-wd ran in " + $here) -and $null -eq $relBatch.StartError -and $relBatch.Stdout.Trim() -ieq ("pk-wd ran in " + $here)) ("a FilePath with a folder in it (.\pk-wd.cmd) is found relative to the current location (" + $relText + ")")
+
+    $subText = $null
+    try { $subText = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'sub').Stdout.Trim() } catch { $subText = [string]$_ }
+    Test-Assert ($subText -ieq (Join-Path $here 'sub')) ("a relative WorkingDirectory is relative to the current location (" + $subText + ")")
+
+    $null = New-PSDrive -Name PkHarnessWd -PSProvider FileSystem -Root $here -Scope Script
+    try {
+        Push-Location -LiteralPath 'PkHarnessWd:\'
+        try { $onDrive = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim() } finally { Pop-Location }
+        $driveText = $null
+        try { $driveText = (Invoke-PkProcessWithTimeout -FilePath 'PkHarnessWd:\pk-wd.cmd' -WorkingDirectory 'PkHarnessWd:\sub').Stdout.Trim() } catch { $driveText = [string]$_ }
+    } finally { Remove-PSDrive -Name PkHarnessWd -Scope Script }
+    Test-Assert ($onDrive -ieq $here) ("on a drive made with New-PSDrive, the program runs in the real folder behind it (" + $onDrive + ")")
+    Test-Assert ($driveText -ieq ("pk-wd ran in " + (Join-Path $here 'sub'))) ("a FilePath and WorkingDirectory on a New-PSDrive drive are translated to the real folders (" + $driveText + ")")
+    $homeText = $null
+    try { $homeText = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory '~').Stdout.Trim() } catch { $homeText = [string]$_ }
+    Test-Assert ($homeText -ieq (Resolve-Path -LiteralPath '~').ProviderPath) ("a WorkingDirectory of ~ is your home folder (" + $homeText + ")")
+
+    Push-Location -LiteralPath 'HKLM:\'
+    try { $fromReg = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim() } finally { Pop-Location }
+    Test-Assert ($fromReg -ieq $here) ("from a registry location, the program runs in the last file-system location (" + $fromReg + ")")
+
+    Push-Location -LiteralPath $gone
+    try {
+        [System.IO.Directory]::Delete($gone, $true)   # Remove-Item refuses to delete the current location
+        $fromGone = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd'
+        Test-Assert ($fromGone.ExitCode -eq 0 -and $fromGone.Stdout.Trim().TrimEnd('\') -ieq [Environment]::CurrentDirectory.TrimEnd('\')) ("if the current folder has been deleted, the program runs in the process's working directory instead (" + $fromGone.Stdout.Trim() + ")")
+    } finally { Pop-Location }
+
+    $explicit = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory $env:SystemRoot
+    Test-Assert ($explicit.Stdout.Trim() -ieq $env:SystemRoot) "an explicit WorkingDirectory still wins over the current location"
+} finally {
+    Pop-Location
+    Remove-Item -LiteralPath $here, $gone -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
