@@ -1894,6 +1894,57 @@ try {
 }
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== X: each worker job starts clean ===" -ForegroundColor Cyan
+# Worker runspaces are reused from job to job. Each job should start in the
+# caller's location, without anything an earlier job left behind.
+Reset-Harness
+$workerDir = Join-Path $env:TEMP ("pk-harness-worker-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path $workerDir
+[System.IO.File]::WriteAllText((Join-Path $workerDir 'data.txt'), 'worker-data')
+$cleanWorker = {
+    param([int]$Id)
+    $start = [pscustomobject]@{
+        Id       = $Id
+        Location = (Get-Location).ProviderPath
+        Leak     = (Get-Variable -Name pkHarnessLeak -ValueOnly -ErrorAction SilentlyContinue)
+        EAP      = [string]$ErrorActionPreference
+        Data     = (Get-Content -LiteralPath '.\data.txt' -ErrorAction SilentlyContinue)
+    }
+    # Everything that used to carry over to the next job on the same runspace.
+    Set-Location -LiteralPath $env:SystemRoot
+    $pkHarnessLeak = "from job " + $Id
+    $ErrorActionPreference = 'Stop'
+    $start
+}
+Push-Location -LiteralPath $workerDir
+$workerDir = (Get-Location).ProviderPath   # the long form; %TEMP% can be an 8.3 path
+try {
+    $seen = [System.Collections.Generic.List[object]]::new()
+    $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 }, @{ Id = 3 })) `
+        -WorkerScript $cleanWorker -ResultHandler { param($r) $seen.Add($r) }.GetNewClosure()
+    $badLocation = @($seen | Where-Object { $_.Location -ine $workerDir } | ForEach-Object { "job " + $_.Id + "=" + $_.Location })
+    Test-Assert ($seen.Count -eq 3 -and $badLocation.Count -eq 0) ("each worker job starts in the caller's location, even after an earlier job changed folder (wrong: " + ($badLocation -join ', ') + ")")
+    Test-Assert (@($seen | Where-Object { $_.Data -ne 'worker-data' }).Count -eq 0) "a relative path in a worker cmdlet is relative to the caller's location"
+    $leaked = @($seen | Where-Object { $null -ne $_.Leak -or $_.EAP -ne 'Continue' } | ForEach-Object { "job " + $_.Id + ": leak=" + $_.Leak + " EAP=" + $_.EAP })
+    Test-Assert ($leaked.Count -eq 0) ("variables a job sets, preference variables included, don't carry over to the next job (" + ($leaked -join '; ') + ")")
+
+    $null = New-PSDrive -Name PkHarnessJobs -PSProvider FileSystem -Root $workerDir -Scope Script
+    try {
+        Push-Location -LiteralPath 'PkHarnessJobs:\'
+        try {
+            $onDrive = [System.Collections.Generic.List[object]]::new()
+            $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) `
+                -WorkerScript $cleanWorker -ResultHandler { param($r) $onDrive.Add($r) }.GetNewClosure()
+        } finally { Pop-Location }
+    } finally { Remove-PSDrive -Name PkHarnessJobs -Scope Script }
+    Test-Assert ($onDrive.Count -eq 1 -and $onDrive[0].Location -ieq $workerDir) ("from a New-PSDrive drive, workers start in the real folder behind it (" + @($onDrive | ForEach-Object { $_.Location }) + ")")
+} finally {
+    Pop-Location
+    Remove-Item -LiteralPath $workerDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
