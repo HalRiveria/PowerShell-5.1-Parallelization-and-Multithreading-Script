@@ -924,6 +924,58 @@ try {
 } catch { $threw = ($_.ToString() -like "*job 2 supplies 'Typo'*Nothing was started*") }
 [System.Threading.Thread]::Sleep(300)
 Test-Assert ($threw -and $ran.Count -eq 0) ("a bad key in -JobParams is reported before any worker starts (workers run: " + $ran.Count + ")")
+
+# Callbacks built WITHOUT .GetNewClosure() see the kit's locals by dynamic
+# scope. A caller's $results.Add($r) in one used to land in the kit's own
+# worker-output collection, which the kit was looping over: an endless loop.
+# The guard throws instead of hanging the harness if that comes back.
+Reset-Harness
+$results = [System.Collections.Generic.List[object]]::new()
+$loopGuard = @{ Calls = 0 }
+$threw = $null
+try {
+    $null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 })) -WorkerScript { param([int]$Id) $Id } -ResultHandler {
+        param($r)
+        $loopGuard.Calls++
+        if ($loopGuard.Calls -gt 20) { throw 'still looping after 20 handler calls' }
+        $results.Add($r)
+    }
+} catch { $threw = $_.Exception.Message }
+Test-Assert ($null -eq $threw -and $loopGuard.Calls -eq 2 -and $results.Count -eq 2) ("a -ResultHandler without a closure: `$results.Add reaches the caller's list and doesn't loop (calls=" + $loopGuard.Calls + ", count=" + $results.Count + ", threw=" + $threw + ")")
+
+# The same on the abort-drain path, which collects results separately.
+Reset-Harness
+$results = [System.Collections.Generic.List[object]]::new()
+$loopGuard = @{ Calls = 0 }
+$poll = @{ Count = 0 }
+$threw = $null
+try {
+    $null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 }, @{ Id = 3 })) -WorkerScript {
+        param([int]$Id)
+        # Finish only after the abort, and late enough that the main loop has
+        # already handed over to the drain.
+        for ($i = 0; $i -lt 100; $i++) { if (Test-PkCancelRequested) { break }; [System.Threading.Thread]::Sleep(50) }
+        [System.Threading.Thread]::Sleep(500)
+        return $Id
+    } -PollCallback { $poll.Count++; if ($poll.Count -eq 3) { Request-PkAbort } }.GetNewClosure() -ResultHandler {
+        param($r)
+        $loopGuard.Calls++
+        if ($loopGuard.Calls -gt 20) { throw 'still looping after 20 handler calls' }
+        $results.Add($r)
+    }
+} catch { $threw = $_.Exception.Message }
+# The wait message only appears when the drain had running jobs to collect,
+# so this also proves the results came through the drain, not the main loop.
+$drained = @($script:messages | Where-Object { $_.Message -like '*Waiting for current jobs*' }).Count -eq 1
+Test-Assert ($null -eq $threw -and $loopGuard.Calls -eq 2 -and $results.Count -eq 2 -and $drained) ("a -ResultHandler without a closure doesn't loop during an abort drain either (calls=" + $loopGuard.Calls + ", count=" + $results.Count + ", drained=" + $drained + ", threw=" + $threw + ")")
+
+# A -JobCrashedHandler without a closure used to find the kit's $null
+# $results instead of the caller's, and the error was swallowed.
+Reset-Harness
+$results = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param([int]$Id) throw "x" } -JobCrashedHandler { param($e) $results.Add($e) }
+Test-Assert ($results.Count -eq 1) ("a -JobCrashedHandler without a closure reaches the caller's `$results (count=" + $results.Count + ")")
+Reset-Harness
 Write-Host ""
 
 # ==============================================================================

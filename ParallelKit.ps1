@@ -1624,16 +1624,20 @@ function Receive-PkCompletedHandles {
     $stillActive = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($h in $Handles) {
         if ($h.Handle.IsCompleted) {
-            $results = $null
+            # Not $results: a -ResultHandler built without .GetNewClosure() sees
+            # this function's locals, and $results.Add($r) there would grow the
+            # collection this loop walks, so it never ends. Same in
+            # Invoke-PkRunspaceJobs.
+            $pkWorkerOutput = $null
             try {
-                $results = $h.PS.EndInvoke($h.Handle)
+                $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
             } catch {
                 if ($null -ne $ErrorHandler) { $null = & $ErrorHandler ("Error collecting runspace result during abort drain: " + $_) }
             } finally {
                 $h.PS.Dispose()
             }
-            if ($null -ne $ResultHandler -and $null -ne $results) {
-                foreach ($r in $results) { $null = & $ResultHandler $r }
+            if ($null -ne $ResultHandler -and $null -ne $pkWorkerOutput) {
+                foreach ($r in $pkWorkerOutput) { $null = & $ResultHandler $r }
             }
         } else {
             $stillActive.Add($h)
@@ -1920,9 +1924,13 @@ function Invoke-PkRunspaceJobs {
             $stillPending = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($h in $handles) {
                 if ($h.Handle.IsCompleted) {
-                    $results = $null
+                    # Not $results: a -ResultHandler or -JobCrashedHandler built
+                    # without .GetNewClosure() sees this function's locals, and
+                    # $results.Add($r) there would grow the collection this loop
+                    # walks, so it never ends. Same in Receive-PkCompletedHandles.
+                    $pkWorkerOutput = $null
                     try {
-                        $results = $h.PS.EndInvoke($h.Handle)
+                        $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
                         if ($h.PS.HadErrors) {
                             foreach ($e in $h.PS.Streams.Error) { Invoke-PkMessageHandler -Message ("Runspace error: " + $e.ToString()) -Level Error }
                         }
@@ -1936,8 +1944,8 @@ function Invoke-PkRunspaceJobs {
                     } finally {
                         $h.PS.Dispose()
                     }
-                    if ($null -ne $results) {
-                        foreach ($r in $results) { $null = & $ResultHandler $r }
+                    if ($null -ne $pkWorkerOutput) {
+                        foreach ($r in $pkWorkerOutput) { $null = & $ResultHandler $r }
                     }
                 } else {
                     $stillPending.Add($h)
