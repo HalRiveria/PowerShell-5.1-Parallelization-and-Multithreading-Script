@@ -128,6 +128,42 @@ Test-Assert ($out.CrashedCount -eq 1 -and $crashes.Count -eq 1) "a worker that t
 Test-Assert ($results.Count -eq 2) "the other workers still return their results"
 Test-Assert (@($script:messages | Where-Object { $_.Level -eq 'Error' -and $_.Message -like '*boom*' }).Count -eq 1) "the crash is reported as an Error message"
 
+# Which job crashed: on the return object, and to a handler that asks for it.
+$crashedProp = $out.PSObject.Properties['Crashed']   # read safely: strict mode throws on a missing property
+Test-Assert ($null -ne $crashedProp -and @($crashedProp.Value).Count -eq 1 -and $crashedProp.Value[0].Job['Id'] -eq 2 -and $crashedProp.Value[0].Error -is [System.Management.Automation.ErrorRecord]) "the return object lists the crashed job and its error"
+$crashWorker = { param([int]$Id) if ($Id -eq 2) { throw "boom" }; return $Id }
+$seenJobs = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkRunspaceJobs -WorkerScript $crashWorker -JobParams $jobs -MaxParallel 2 -JobCrashedHandler { param($e, $job) $seenJobs.Add($job) }.GetNewClosure()
+Test-Assert ($seenJobs.Count -eq 1 -and $null -ne $seenJobs[0] -and $seenJobs[0]['Id'] -eq 2) "a -JobCrashedHandler with a second parameter gets the job that crashed"
+$seenArgs = @{ Count = -1; Id = $null }
+$null = Invoke-PkRunspaceJobs -WorkerScript $crashWorker -JobParams $jobs -MaxParallel 2 -JobCrashedHandler { $seenArgs.Count = $args.Count; $seenArgs.Id = $args[1]['Id'] }.GetNewClosure()
+Test-Assert ($seenArgs.Count -eq 2 -and $seenArgs.Id -eq 2) ("a -JobCrashedHandler with no param() gets the error and the job in `$args (count " + $seenArgs.Count + ")")
+# One-parameter handlers that would throw on a second argument still work.
+$advanced = @{ Calls = 0 }
+$null = Invoke-PkRunspaceJobs -WorkerScript $crashWorker -JobParams $jobs -MaxParallel 2 -JobCrashedHandler { [CmdletBinding()] param($e) $advanced.Calls++ }.GetNewClosure()
+Test-Assert ($advanced.Calls -eq 1) "a one-parameter [CmdletBinding()] -JobCrashedHandler is still called"
+function Receive-HarnessCrash($e, $job) { $script:harnessCrashId = $job['Id'] }
+$script:harnessCrashId = $null
+$null = Invoke-PkRunspaceJobs -WorkerScript $crashWorker -JobParams $jobs -MaxParallel 2 -JobCrashedHandler ${function:Receive-HarnessCrash}
+Test-Assert ($script:harnessCrashId -eq 2) "a function used as -JobCrashedHandler, with function f(`$e, `$job) parameters, gets the job"
+# A handler that throws is reported, not swallowed.
+Reset-Harness
+$null = Invoke-PkRunspaceJobs -WorkerScript $crashWorker -JobParams $jobs -MaxParallel 2 -JobCrashedHandler { param($e) throw "handler bug" }
+Test-Assert (@($script:messages | Where-Object { $_.Message -like '*-JobCrashedHandler threw*handler bug*' }).Count -eq 1) "a -JobCrashedHandler that throws is reported as a message"
+# Workers that throw while an abort waits for them count as crashes too.
+Reset-Harness
+$poll = @{ Count = 0 }
+$drainCrashes = [System.Collections.Generic.List[object]]::new()
+$drainOut = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 })) -WorkerScript {
+    param([int]$Id)
+    for ($i = 0; $i -lt 100; $i++) { if (Test-PkCancelRequested) { break }; [System.Threading.Thread]::Sleep(50) }
+    [System.Threading.Thread]::Sleep(500)
+    throw ("drain boom " + $Id)
+} -PollCallback { $poll.Count++; if ($poll.Count -eq 3) { Request-PkAbort } }.GetNewClosure() -JobCrashedHandler { param($e, $job) $drainCrashes.Add($job['Id']) }.GetNewClosure()
+$drainCrashedProp = $drainOut.PSObject.Properties['Crashed']
+Test-Assert ($drainOut.Aborted -and $drainOut.CrashedCount -eq 2 -and $null -ne $drainCrashedProp -and @($drainCrashedProp.Value).Count -eq 2 -and $drainCrashes.Count -eq 2) ("workers that throw during an abort's drain are counted and reported (counted " + $drainOut.CrashedCount + ", handler calls " + $drainCrashes.Count + ")")
+Reset-Harness
+
 $threw = $false
 try { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) } -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 -SharedFunctionNames @('No-SuchFunction') } catch { $threw = ($_.ToString() -like "*No-SuchFunction*") }
 Test-Assert $threw "an unknown -SharedFunctionNames entry fails up front with the name in the message"
@@ -1304,7 +1340,7 @@ Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTime
 $shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
 $shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
-Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
+Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted,Crashed') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
 $shapeFindings = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [Func[int]]{ 1 } }
 $shapeFinding = $shapeFindings[0]
 Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")

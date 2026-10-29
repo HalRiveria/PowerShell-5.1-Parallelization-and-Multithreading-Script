@@ -184,10 +184,21 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
-- `-JobCrashedHandler { param($err) ... }` is told when a worker throws. That job's result handler isn't called.
+- `-JobCrashedHandler { param($err, $job) ... }` is told when a worker throws, including while an abort waits for running workers, with the job hashtable that crashed. Leave `$job` out of `param()` if you don't need it. `$err.Exception.InnerException` is the worker's own error. That job's result handler isn't called, and anything the worker output before throwing is lost. If the handler itself throws, that's reported as a message and the run carries on.
+- Only an error that stops the worker counts as a crash: `throw`, a cmdlet with `-ErrorAction Stop`, or any error once the worker sets `$ErrorActionPreference = 'Stop'`. A non-terminating error (a locked file in `Get-FileHash`, a `Write-Error`) is only printed as `Runspace error: ...`, and whatever the worker returned still goes to `-ResultHandler` as if it had worked. Workers start with PowerShell's default preferences and no strict mode, whatever your script uses. To catch every failure and know which input it came from, have the worker return its own error object:
+
+  ```powershell
+  WorkerScript = {
+      param($Path)
+      $ErrorActionPreference = 'Stop'
+      try   { [pscustomobject]@{ Path = $Path; Hash = (Get-FileHash -LiteralPath $Path).Hash; Error = $null } }
+      catch { [pscustomobject]@{ Path = $Path; Hash = $null; Error = $_.Exception.Message } }
+  }
+  ```
+- Don't call `exit` in a worker. It ends that job quietly (not as a crash) and sets your whole script's exit code.
 - `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
-- Returns an object with `ForceStoppedCount`, `CrashedCount` and `Aborted`.
+- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted` and `Crashed`, which lists the `Job` and `Error` of each worker that threw.
 
 ## The two rules for worker code
 

@@ -1730,11 +1730,54 @@ function Get-PkWorkerSafeFunctionNames {
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath')
 }
 
+function Get-PkHandlerParamCount {
+    # How many parameters a callback declares, or -1 if it has no param()
+    # block (it takes whatever it's given, in $args).
+    param([Parameter(Mandatory)][scriptblock]$Callback)
+    $ast = $Callback.Ast
+    if ($ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        if ($null -ne $ast.Parameters) { return $ast.Parameters.Count }   # function f($a, $b)
+        $ast = $ast.Body
+    }
+    if ($null -eq $ast.ParamBlock) { return -1 }
+    return $ast.ParamBlock.Parameters.Count
+}
+
+function Add-PkCrashedJob {
+    # A worker threw: count it, record it with its job on the run's outcome,
+    # announce it, and tell -JobCrashedHandler. Shared by the main loop and
+    # the abort drain. pk-prefixed parameters: a handler built without
+    # .GetNewClosure() can see them.
+    param(
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$PkOutcome,
+        [hashtable]$PkJob,
+        [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$PkError,
+        [scriptblock]$PkHandler,
+        [string]$PkWhen = ""
+    )
+    $PkOutcome.CrashedCount++
+    $PkOutcome.Crashed.Add([pscustomobject][ordered]@{ Job = $PkJob; Error = $PkError })
+    Invoke-PkMessageHandler -Level Error -Message ("Error collecting runspace result" + $PkWhen + ": " + $PkError)
+    if ($null -eq $PkHandler) { return }
+    try {
+        # The job only goes to a handler that has room for it: a one-parameter
+        # handler with [CmdletBinding()] or [Parameter()] would throw on a
+        # second argument.
+        $pkParamCount = Get-PkHandlerParamCount -Callback $PkHandler
+        if ($pkParamCount -eq -1 -or $pkParamCount -ge 2) { $null = & $PkHandler $PkError $PkJob }
+        else { $null = & $PkHandler $PkError }
+    } catch {
+        # Reported, not rethrown: a broken crash handler mustn't take the other workers down.
+        Invoke-PkMessageHandler -Level Error -Message ("-JobCrashedHandler threw: " + $_)
+    }
+}
+
 function Receive-PkCompletedHandles {
     param(
         [System.Collections.Generic.List[hashtable]]$Handles,
         [scriptblock]$ResultHandler,
-        [scriptblock]$ErrorHandler
+        [System.Collections.Specialized.OrderedDictionary]$Outcome,
+        [scriptblock]$JobCrashedHandler
     )
     $stillActive = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($h in $Handles) {
@@ -1747,7 +1790,7 @@ function Receive-PkCompletedHandles {
             try {
                 $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
             } catch {
-                if ($null -ne $ErrorHandler) { $null = & $ErrorHandler ("Error collecting runspace result during abort drain: " + $_) }
+                Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $_ -PkHandler $JobCrashedHandler -PkWhen " during abort drain"
             } finally {
                 $h.PS.Dispose()
             }
@@ -1773,7 +1816,9 @@ function Invoke-PkGracefulDrain {
         [scriptblock]$ResultHandler,
         [System.Collections.Concurrent.ConcurrentQueue[object]]$MessageQueue,
         [int]$TimeoutSeconds = 60,
-        [string]$AbortWaitMessage
+        [string]$AbortWaitMessage,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Outcome,
+        [scriptblock]$JobCrashedHandler
     )
 
     if ($Handles.Count -eq 0) {
@@ -1784,7 +1829,6 @@ function Invoke-PkGracefulDrain {
         $AbortWaitMessage = "[ABORT] Waiting for current jobs to finish (up to " + $TimeoutSeconds + "s)..."
     }
 
-    $errorHandler  = { param($msg) Invoke-PkMessageHandler -Message $msg -Level Error }
     $localHandles  = $Handles
     $abortDeadline = [System.Diagnostics.Stopwatch]::StartNew()
     $forceStoppedCount = 0
@@ -1792,14 +1836,14 @@ function Invoke-PkGracefulDrain {
     if ($AbortWaitMessage -ne "") { Invoke-PkMessageHandler -Message $AbortWaitMessage -Level Warn }
 
     while ($localHandles.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $abortDeadline.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler
         Receive-PkWorkerMessages -Queue $MessageQueue
         if ($localHandles.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
     }
 
     # One final pass before declaring anything force-stopped.
     if ($localHandles.Count -gt 0) {
-        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler
         Receive-PkWorkerMessages -Queue $MessageQueue
     }
 
@@ -1828,6 +1872,8 @@ function Invoke-PkRunspaceJobs {
     # functions, so name every function of yours it calls in -SharedFunctionNames.
     # Each job starts in your current location, in a fresh scope: a folder change
     # or a variable from an earlier job doesn't carry over.
+    # Only an error that stops the worker (throw, -ErrorAction Stop) counts as a
+    # crash; a non-terminating one is printed and the job's output still counts.
     # The worker code is checked against the worker rules (see the README)
     # before anything starts, and each job's values before that job starts;
     # code or values that break them are refused.
@@ -1851,7 +1897,11 @@ function Invoke-PkRunspaceJobs {
     # .PARAMETER PollCallback
     # { } on the main thread, every loop pass (for progress and the like).
     # .PARAMETER JobCrashedHandler
-    # { param($errorRecord) } on the main thread when a worker throws.
+    # { param($errorRecord, $job) } on the main thread when a worker throws, also
+    # during an abort's drain. $job is the job hashtable that crashed; leave it out
+    # of param() if you don't need it. The worker's own error is
+    # $errorRecord.Exception.InnerException. If the handler throws, that's reported
+    # as a message and the run carries on.
     # .PARAMETER DrainTimeoutSeconds
     # How long an abort waits for running workers before force-stopping them
     # (default 60).
@@ -1861,7 +1911,8 @@ function Invoke-PkRunspaceJobs {
     # Check the worker code and job values before starting (default on).
     # -CheckWorkerSafety:$false turns it off.
     # .OUTPUTS
-    # An object with ForceStoppedCount, CrashedCount and Aborted.
+    # An object with ForceStoppedCount, CrashedCount, Aborted and Crashed (one
+    # @{ Job; Error } entry per worker that threw).
     # .EXAMPLE
     # Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) $Id * 2 } -ResultHandler { param($r) Write-Host $r }
     param(
@@ -1908,7 +1959,7 @@ function Invoke-PkRunspaceJobs {
         $JobParams = $normalizedJobs
     }
 
-    $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false }
+    $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false; Crashed = [System.Collections.Generic.List[object]]::new() }
     if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return [pscustomobject]$outcome }
 
     if ($CheckWorkerSafety) {
@@ -2048,7 +2099,7 @@ function Invoke-PkRunspaceJobs {
                 # A local scope too, so variables a job sets (preference
                 # variables included) don't carry over to the next job.
                 $null = $ps.AddScript($jobScript, $true).AddParameter('PkJobLocation', $jobLocation).AddParameter('PkJobValues', $jobValues)
-                $handles.Add(@{ PS = $ps; Handle = $ps.BeginInvoke() })
+                $handles.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Job = $nextJob })
             }
 
             $null = Test-PkAbortSignal
@@ -2071,10 +2122,7 @@ function Invoke-PkRunspaceJobs {
                     } catch {
                         # The worker itself threw - there is no result, so
                         # -ResultHandler is never called for this job.
-                        $outcome.CrashedCount++
-                        Invoke-PkMessageHandler -Message ("Error collecting runspace result: " + $_) -Level Error
-                        # Swallowed: a broken crash handler must not take the other workers down with it.
-                        if ($null -ne $JobCrashedHandler) { try { $null = & $JobCrashedHandler $_ } catch { } }
+                        Add-PkCrashedJob -PkOutcome $outcome -PkJob $h['Job'] -PkError $_ -PkHandler $JobCrashedHandler
                     } finally {
                         $h.PS.Dispose()
                     }
@@ -2090,7 +2138,7 @@ function Invoke-PkRunspaceJobs {
         }
 
         if ($Cts.Token.IsCancellationRequested) {
-            $drainArgs = @{ Handles = $handles; ResultHandler = $ResultHandler; MessageQueue = $messageQueue; TimeoutSeconds = $DrainTimeoutSeconds }
+            $drainArgs = @{ Handles = $handles; ResultHandler = $ResultHandler; MessageQueue = $messageQueue; TimeoutSeconds = $DrainTimeoutSeconds; Outcome = $outcome; JobCrashedHandler = $JobCrashedHandler }
             if ($PSBoundParameters.ContainsKey('AbortWaitMessage')) { $drainArgs.AbortWaitMessage = $AbortWaitMessage }
             $drainResult = Invoke-PkGracefulDrain @drainArgs
             $outcome.ForceStoppedCount = $drainResult.ForceStoppedCount
