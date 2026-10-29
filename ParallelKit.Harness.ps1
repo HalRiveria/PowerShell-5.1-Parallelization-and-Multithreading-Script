@@ -1849,6 +1849,9 @@ try {
 
     $relText = $null
     try { $relText = (Invoke-PkProcessWithTimeout -FilePath '.\pk-wd.cmd').Stdout.Trim() } catch { $relText = [string]$_ }
+    $missingText = ''
+    try { $null = Invoke-PkProcessWithTimeout -FilePath '.\no-such-tool.exe' } catch { $missingText = [string]$_ }
+    Test-Assert ($missingText -like ("*'.\no-such-tool.exe' (" + (Join-Path $here 'no-such-tool.exe') + ")*")) ("a program that can't be started is named with the full path that was tried (" + $missingText + ")")
     $relBatch = (Invoke-PkProcessBatch -Commands @(@{ FilePath = '.\pk-wd.cmd' })).Results[0]
     Test-Assert ($relText -ieq ("pk-wd ran in " + $here) -and $null -eq $relBatch.StartError -and $relBatch.Stdout.Trim() -ieq ("pk-wd ran in " + $here)) ("a FilePath with a folder in it (.\pk-wd.cmd) is found relative to the current location (" + $relText + ")")
 
@@ -1860,8 +1863,14 @@ try {
     try {
         Push-Location -LiteralPath 'PkHarnessWd:\'
         try { $onDrive = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim() } finally { Pop-Location }
+        $driveText = $null
+        try { $driveText = (Invoke-PkProcessWithTimeout -FilePath 'PkHarnessWd:\pk-wd.cmd' -WorkingDirectory 'PkHarnessWd:\sub').Stdout.Trim() } catch { $driveText = [string]$_ }
     } finally { Remove-PSDrive -Name PkHarnessWd -Scope Script }
     Test-Assert ($onDrive -ieq $here) ("on a drive made with New-PSDrive, the program runs in the real folder behind it (" + $onDrive + ")")
+    Test-Assert ($driveText -ieq ("pk-wd ran in " + (Join-Path $here 'sub'))) ("a FilePath and WorkingDirectory on a New-PSDrive drive are translated to the real folders (" + $driveText + ")")
+    $homeText = $null
+    try { $homeText = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory '~').Stdout.Trim() } catch { $homeText = [string]$_ }
+    Test-Assert ($homeText -ieq (Resolve-Path -LiteralPath '~').ProviderPath) ("a WorkingDirectory of ~ is your home folder (" + $homeText + ")")
 
     Push-Location -LiteralPath 'HKLM:\'
     try { $fromReg = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim() } finally { Pop-Location }
@@ -1871,7 +1880,7 @@ try {
     try {
         [System.IO.Directory]::Delete($gone, $true)   # Remove-Item refuses to delete the current location
         $fromGone = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd'
-        Test-Assert ($fromGone.ExitCode -eq 0 -and $fromGone.Stdout.Trim() -ieq [Environment]::CurrentDirectory.TrimEnd('\')) ("if the current folder has been deleted, the program runs in the process's working directory instead (" + $fromGone.Stdout.Trim() + ")")
+        Test-Assert ($fromGone.ExitCode -eq 0 -and $fromGone.Stdout.Trim().TrimEnd('\') -ieq [Environment]::CurrentDirectory.TrimEnd('\')) ("if the current folder has been deleted, the program runs in the process's working directory instead (" + $fromGone.Stdout.Trim() + ")")
     } finally { Pop-Location }
 
     $explicit = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory $env:SystemRoot
