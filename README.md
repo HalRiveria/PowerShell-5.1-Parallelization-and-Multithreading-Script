@@ -82,7 +82,7 @@ What none of them do for you:
 
 ## Setup
 
-Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.0 and later), put it in your project, and dot-source it from your script:
+Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.1 and later), put it in your project, and dot-source it from your script:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
