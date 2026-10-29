@@ -1841,6 +1841,9 @@ function Get-HarnessCd {
     return $wd
 }
 Push-Location -LiteralPath $here
+# %TEMP% can be an 8.3 short path (C:\Users\RUNNER~1\... on GitHub's
+# runners); compare against the folder as PowerShell reports it.
+$here = (Get-Location).ProviderPath
 try {
     Test-Assert ([Environment]::CurrentDirectory -ne $here) ("precondition: the process's working directory isn't the test folder (" + [Environment]::CurrentDirectory + ")")
     $wd = Get-HarnessCd
