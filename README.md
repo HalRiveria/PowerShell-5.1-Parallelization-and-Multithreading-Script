@@ -180,6 +180,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - If the worker declares a `$CancelToken` parameter, it gets the run's cancellation token.
 - `-JobParams` takes a list or array of job hashtables. A single hashtable works too, so a list that happens to hold one job is fine.
 - A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there, and cmdlets and functions from installed modules load on their own. A module you imported by path isn't installed, so list its functions too (or put it on `$env:PSModulePath`).
+- Each job starts in your current location (the real folder, if you're on a `New-PSDrive` drive), in a fresh scope. A folder change or a variable one job makes, preference variables like `$ErrorActionPreference` included, doesn't carry over to the next job. Relative paths in .NET calls such as `[System.IO.File]::ReadAllText('x.txt')` still go by the process's working directory, as they do outside workers, so give .NET full paths.
 - Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.

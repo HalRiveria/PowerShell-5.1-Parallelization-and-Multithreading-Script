@@ -1826,6 +1826,8 @@ function Invoke-PkRunspaceJobs {
     # Each job hashtable's keys become the worker's parameters. A worker runspace
     # starts empty apart from cmdlets, installed modules and the kit's own worker
     # functions, so name every function of yours it calls in -SharedFunctionNames.
+    # Each job starts in your current location, in a fresh scope: a folder change
+    # or a variable from an earlier job doesn't carry over.
     # The worker code is checked against the worker rules (see the README)
     # before anything starts, and each job's values before that job starts;
     # code or values that break them are refused.
@@ -1983,6 +1985,22 @@ function Invoke-PkRunspaceJobs {
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $MaxParallel, $iss, $Host)
         $pool.Open()
 
+        # Each job starts in the caller's current location, the folder
+        # Start-PkProcess defaults to as well. The real folder, not a drive
+        # name: a New-PSDrive drive doesn't exist in the worker.
+        $workerLocation = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+        # Every job runs this: move to that folder, then run the worker in a
+        # scope of its own with the job's values. Set per job because
+        # runspaces are reused: a job that changed folder would otherwise move
+        # the next one too. One script rather than a Set-Location statement
+        # ahead of the worker: with a second statement, a pool runspace's
+        # pipeline hadn't completed after 10 s in testing, on 5.1 and 7. The
+        # prefix shares the worker's first line, so error line numbers still
+        # match its code. If the folder is gone by the time a job starts, the
+        # job runs wherever its runspace already is, without an error per job.
+        $jobScript = 'param([string]$PkJobLocation, [hashtable]$PkJobValues) if ($PkJobLocation) { Set-Location -LiteralPath $PkJobLocation -ErrorAction SilentlyContinue }; & {' +
+            $WorkerScript.ToString() + "`n} @PkJobValues"
+
         while ((-not $scanExhausted -or $handles.Count -gt 0) -and -not $Cts.Token.IsCancellationRequested) {
 
             while (-not $scanExhausted -and $handles.Count -lt $MaxParallel -and -not $Cts.Token.IsCancellationRequested) {
@@ -2020,11 +2038,16 @@ function Invoke-PkRunspaceJobs {
 
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
-                $null = $ps.AddScript($WorkerScript)
-                foreach ($key in $nextJob.Keys) { $null = $ps.AddParameter($key, $nextJob[$key]) }
+                $jobValues = @{}
+                foreach ($key in $nextJob.Keys) { $jobValues[$key] = $nextJob[$key] }
                 if ($declaredParams.Contains('CancelToken') -and -not $nextJob.ContainsKey('CancelToken')) {
-                    $null = $ps.AddParameter("CancelToken", $Cts.Token)
+                    $jobValues['CancelToken'] = $Cts.Token
                 }
+                $jobLocation = ""
+                if ([System.IO.Directory]::Exists($workerLocation)) { $jobLocation = $workerLocation }
+                # A local scope too, so variables a job sets (preference
+                # variables included) don't carry over to the next job.
+                $null = $ps.AddScript($jobScript, $true).AddParameter('PkJobLocation', $jobLocation).AddParameter('PkJobValues', $jobValues)
                 $handles.Add(@{ PS = $ps; Handle = $ps.BeginInvoke() })
             }
 
