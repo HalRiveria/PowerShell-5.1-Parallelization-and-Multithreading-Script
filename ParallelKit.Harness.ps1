@@ -964,7 +964,10 @@ try {
         $results.Add($r)
     }
 } catch { $threw = $_.Exception.Message }
-Test-Assert ($null -eq $threw -and $loopGuard.Calls -eq 2 -and $results.Count -eq 2) ("a -ResultHandler without a closure doesn't loop during an abort drain either (calls=" + $loopGuard.Calls + ", count=" + $results.Count + ", threw=" + $threw + ")")
+# The wait message only appears when the drain had running jobs to collect,
+# so this also proves the results came through the drain, not the main loop.
+$drained = @($script:messages | Where-Object { $_.Message -like '*Waiting for current jobs*' }).Count -eq 1
+Test-Assert ($null -eq $threw -and $loopGuard.Calls -eq 2 -and $results.Count -eq 2 -and $drained) ("a -ResultHandler without a closure doesn't loop during an abort drain either (calls=" + $loopGuard.Calls + ", count=" + $results.Count + ", drained=" + $drained + ", threw=" + $threw + ")")
 
 # A -JobCrashedHandler without a closure used to find the kit's $null
 # $results instead of the caller's, and the error was swallowed.
