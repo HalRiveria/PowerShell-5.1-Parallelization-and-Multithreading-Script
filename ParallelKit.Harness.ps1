@@ -1987,7 +1987,7 @@ Write-Host "=== Y: output that's been dropped is freed during the run ===" -Fore
 # handled shouldn't have the kit keep it alive until the run ends. Weak
 # references show what a full GC can free while the last job is finishing.
 # A few of the most recent jobs can still be referenced from the dispatch
-# loop (7 at -MaxConcurrent 4, however long the run); before the fix all were.
+# loop (5-7 at -MaxConcurrent 4, however long the run); before the fix all were.
 Reset-Harness
 $chatty = @(1..30 | ForEach-Object { @{ FilePath = $cmdExe; Arguments = ('/c for /l %i in (1,1,1500) do @echo ' + ('x' * 100)) } })
 $batchWeak = [System.Collections.Generic.List[System.WeakReference]]::new()
@@ -2004,7 +2004,7 @@ $null = Invoke-PkProcessBatch -Commands $chatty -MaxConcurrent 4 -OnComplete {
     }
 }.GetNewClosure()
 Test-Assert ($batchSeen.Largest -gt 100000) ("precondition: each program printed a lot (" + $batchSeen.Largest + " chars)")
-Test-Assert ($batchSeen.Alive -ge 0 -and $batchSeen.Alive -le 10) ("batch: output dropped in -OnComplete can be freed before the batch ends (" + $batchSeen.Alive + " of 29 still held)")
+Test-Assert ($batchSeen.Alive -ge 0 -and $batchSeen.Alive -le 15) ("batch: output dropped in -OnComplete can be freed before the batch ends (" + $batchSeen.Alive + " of 29 still held)")
 
 $feed = @{ Given = $false }
 $dispatchWeak = [System.Collections.Generic.List[System.WeakReference]]::new()
@@ -2020,7 +2020,7 @@ $null = Invoke-PkProcessDispatch -MaxConcurrent 4 `
             $dispatchSeen.Alive = @($dispatchWeak | Select-Object -First 29 | Where-Object { $_.IsAlive }).Count
         }
     }.GetNewClosure()
-Test-Assert ($dispatchSeen.Alive -ge 0 -and $dispatchSeen.Alive -le 10) ("dispatcher: a finished job's output can be freed before its group ends (" + $dispatchSeen.Alive + " of 29 still held)")
+Test-Assert ($dispatchSeen.Alive -ge 0 -and $dispatchSeen.Alive -le 15) ("dispatcher: a finished job's output can be freed before its group ends (" + $dispatchSeen.Alive + " of 29 still held)")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null

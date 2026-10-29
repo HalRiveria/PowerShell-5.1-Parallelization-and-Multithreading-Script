@@ -1210,10 +1210,12 @@ function Invoke-PkProcessDispatch {
 function Add-PkDispatchGroupJobs {
     # Builds one group's jobs, tags them with the group and queues them.
     # Returns how many were queued. Its own function, not inline in the
-    # dispatch loop, so the group's job list dies with this call: kept in the
-    # loop's frame it stayed alive for the whole run (nulling the variables
-    # wasn't enough once PowerShell had compiled the loop), and with it every
+    # dispatch loop, so the group's job list dies with this call. Kept in the
+    # loop's frame it stayed alive for the whole run, and with it every
     # finished job's output, even output the caller had already dropped.
+    # Nulling the variables in the loop didn't help once the kit had run many
+    # times in a session (most likely PowerShell's compiled code keeping its
+    # own references); a separate call did.
     param(
         [Parameter(Mandatory)][scriptblock]$JobBuilder,
         $GroupInfo,
