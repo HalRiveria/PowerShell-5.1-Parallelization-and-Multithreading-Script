@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# GitHub's Windows runners can deliver real console events, so the harness's
+# Ctrl+C/window-close checks must run here: a skip counts as a failure.
+env:
+  PK_HARNESS_NO_SKIP: '1'
+
 jobs:
   harness:
     name: Harness
