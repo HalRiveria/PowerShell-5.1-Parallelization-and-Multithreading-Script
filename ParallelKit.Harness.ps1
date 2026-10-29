@@ -1445,7 +1445,8 @@ Test-Assert ($reasons[0] -like '*within 5s*' -and $reasons[1] -like '*pressed ag
 function Start-HarnessPresses {
     $timer = [PowerShell]::Create()
     $null = $timer.AddScript({
-        [System.Threading.Thread]::Sleep(700);  $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+        # 1.5s gives a slow machine time to start everything before the abort.
+        [System.Threading.Thread]::Sleep(1500); $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
         [System.Threading.Thread]::Sleep(1800); $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
     })
     return @{ PS = $timer; Handle = $timer.BeginInvoke() }
