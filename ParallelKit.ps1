@@ -1993,10 +1993,12 @@ function Invoke-PkRunspaceJobs {
         # scope of its own with the job's values. Set per job because
         # runspaces are reused: a job that changed folder would otherwise move
         # the next one too. One script rather than a Set-Location statement
-        # ahead of the worker: a second statement in a pool runspace's
-        # pipeline never completes (seen on 5.1 and 7). The prefix shares the
-        # worker's first line, so error line numbers still match its code.
-        $jobScript = 'param([string]$PkJobLocation, [hashtable]$PkJobValues) if ($PkJobLocation) { Set-Location -LiteralPath $PkJobLocation }; & {' +
+        # ahead of the worker: with a second statement, a pool runspace's
+        # pipeline hadn't completed after 10 s in testing, on 5.1 and 7. The
+        # prefix shares the worker's first line, so error line numbers still
+        # match its code. If the folder is gone by the time a job starts, the
+        # job runs wherever its runspace already is, without an error per job.
+        $jobScript = 'param([string]$PkJobLocation, [hashtable]$PkJobValues) if ($PkJobLocation) { Set-Location -LiteralPath $PkJobLocation -ErrorAction SilentlyContinue }; & {' +
             $WorkerScript.ToString() + "`n} @PkJobValues"
 
         while ((-not $scanExhausted -or $handles.Count -gt 0) -and -not $Cts.Token.IsCancellationRequested) {
