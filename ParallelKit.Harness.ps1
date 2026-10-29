@@ -503,7 +503,8 @@ Test-Assert ($leaked -eq $false) "each run starts with a clean abort state"
 Write-Host ""
 
 # Every public function has Get-Help help: a synopsis, and a description for
-# each of its parameters.
+# each of its parameters. The same list is the Export-ModuleMember list at the
+# end of ParallelKit.ps1; keep the two in step.
 $publicFunctions = @('Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
     'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',
     'Get-PkAbortTriggerLabel', 'Invoke-PkRun', 'ConvertTo-PkArgumentString', 'Start-PkProcess', 'Stop-PkProcessTree',
@@ -2049,6 +2050,8 @@ Test-Assert ($sawTimeout.Value -eq 99) ("a plain -OnComplete reads the caller's 
 Remove-Variable -Name TimeoutSeconds
 $outcome = @{}
 $plainJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param([int]$Id) @{ Id = ("job" + $Id) } } -ResultHandler { param($r) $outcome[$r.Id] = 1 }
+$privateCall = @(Test-PkWorkerSafety -WorkerScript { param($N) Invoke-PkMessageHandler -Message 'x' -Level Info })
+Test-Assert ($privateCall.Count -eq 1 -and $privateCall[0].Rule -eq 'MissingFunction') ("worker code calling one of the kit's private helpers is still flagged (" + (@($privateCall | ForEach-Object { $_.Rule }) -join ',') + ")")
 Test-Assert ($outcome.Count -eq 1 -and @($plainJobs.PSObject.Properties).Count -eq 4) ("a plain -ResultHandler writes to the caller's `$outcome, not the kit's return value (caller's " + $outcome.Count + ")")
 $ScriptBlock = 'mine'
 $fromRun = Invoke-PkRun { $ScriptBlock }

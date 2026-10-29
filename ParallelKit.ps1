@@ -2436,7 +2436,16 @@ function Test-PkWorkerSafetyCore {
             $cmdName = $c.GetCommandName()
             if (-not $cmdName) { continue }
             if ($c.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
-            if (-not $kindCache.ContainsKey($cmdName)) { $kindCache[$cmdName] = Get-PkCommandKind -Fn $resolvedFns[$cmdName] }
+            if (-not $kindCache.ContainsKey($cmdName)) {
+                $fnForKind = $resolvedFns[$cmdName]
+                if ($null -eq $fnForKind) {
+                    # One of the kit's private helpers: invisible to the caller,
+                    # but a worker can't run it unless it's worker-safe either.
+                    $ownFn = Get-Item -LiteralPath ('Function:' + $cmdName) -ErrorAction SilentlyContinue
+                    if ($null -ne $ownFn -and $ownFn.ModuleName -eq 'ParallelKit') { $fnForKind = $ownFn }
+                }
+                $kindCache[$cmdName] = Get-PkCommandKind -Fn $fnForKind
+            }
             $kind = $kindCache[$cmdName]
             if ($kind -eq 'Function' -and -not $listed.Contains($cmdName)) {
                 $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
@@ -2530,6 +2539,8 @@ function Test-PkWorkerSafetyCore {
 # Imported globally (Import-Module -Global below): a .GetNewClosure() block
 # can only see global functions, so this is what lets the batch's own
 # callbacks, and yours, call them however your script was started.
+# The same list is $publicFunctions in ParallelKit.Harness.ps1 (which checks
+# each has Get-Help help and is visible); keep the two in step.
 Export-ModuleMember -Function @(
     'Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
     'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',
