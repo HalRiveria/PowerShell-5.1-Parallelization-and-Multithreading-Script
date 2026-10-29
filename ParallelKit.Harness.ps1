@@ -1647,7 +1647,11 @@ $hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $kitPath = Join-Path $PSScriptRoot "ParallelKit.ps1"
 # Events: C = Ctrl+C, B = Ctrl+Break, X = window close. At = seconds after the
 # child logs "ready" (or "idle" when there's no run), or 'idle' = just after
-# the run has returned. WaitFor = what ends the scenario.
+# the run has returned. An event after a Ctrl+C/Ctrl+Break also waits until
+# that helper has reported back and 1.5s more (past the kit's 1s debounce):
+# a helper still attached when the next event lands can be killed by it, and
+# on a slow machine the helper itself can take seconds to start.
+# WaitFor = what ends the scenario.
 $scenarios = @(
     @{ Name = 'ctrlc';       Mode = 'run';   Timeout = 3;  Events = @(@{ Kind = 'C'; At = 1.5 }, @{ Kind = 'C'; At = 'idle' }); WaitFor = 'exit' }
     @{ Name = 'break';       Mode = 'run';   Timeout = 3;  Events = @(@{ Kind = 'B'; At = 1.5 });                              WaitFor = 'idle' }
@@ -1691,6 +1695,15 @@ try {
                 $due = $false
                 if ($e.At -is [string]) { $due = ($idle -ne 0 -and ($now - $idle) / 1e7 -ge 0.5) }
                 else { $due = (($now - $base) / 1e7 -ge [double]$e.At) }
+                $keysIssued = @($s.Sent | Where-Object { $_.Kind -ne 'X' }).Count
+                if ($due -and $keysIssued -gt 0) {
+                    $reports = @(Read-HarnessLines -Path $s.SendLog)
+                    if ($reports.Count -lt $keysIssued) { $due = $false }
+                    else {
+                        $lastReport = $reports[$reports.Count - 1]
+                        if ($lastReport -like 'sent *' -and ($now - [int64]$lastReport.Substring(5)) / 1e7 -lt 1.5) { $due = $false }
+                    }
+                }
                 if ($due -and -not $s.Child.HasExited) {
                     if ($e.Kind -eq 'X') {
                         $hwndLine = @($lines | Where-Object { $_ -like '* hwnd *' })[0]
