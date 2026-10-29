@@ -1557,6 +1557,7 @@ public static class PkHarnessProbe {
     private static string _path;
     public static bool Register(string path) { _path = path; _h = new HandlerRoutine(H); return SetConsoleCtrlHandler(_h, true); }
     private static bool H(uint t) {
+        // A lost line only makes the harness skip; a throw here would end the process.
         try { File.AppendAllText(_path, DateTime.UtcNow.Ticks.ToString() + " event " + t + "\r\n"); } catch { }
         return false;
     }
@@ -1665,6 +1666,7 @@ foreach ($s in $scenarios) {
     $s.Launched = [DateTime]::UtcNow.Ticks
 }
 
+$senders = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $overall = [System.Diagnostics.Stopwatch]::StartNew()
 try {
     while ($overall.Elapsed.TotalSeconds -lt 90 -and @($scenarios | Where-Object { -not $_.Done }).Count -gt 0) {
@@ -1700,7 +1702,7 @@ try {
                         $evType = 0
                         if ($e.Kind -eq 'B') { $evType = 1 }
                         $sendArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $senderScript + '"'), '-TargetPid', $s.Child.Id, '-EventType', $evType, '-LogFile', ('"' + $s.SendLog + '"'))
-                        $null = Start-Process -FilePath $hostExe -ArgumentList $sendArgs -WindowStyle Hidden -PassThru
+                        $senders.Add((Start-Process -FilePath $hostExe -ArgumentList $sendArgs -WindowStyle Hidden -PassThru))
                         $s.Sent.Add(@{ Kind = $e.Kind; Ticks = 0; Ok = $true })
                     }
                     $s.Next++
@@ -1717,6 +1719,9 @@ try {
 } finally {
     # Senders finish within a second of sending; give the last ones time to log.
     [System.Threading.Thread]::Sleep(1500)
+    foreach ($p in $senders) {
+        if (-not $p.WaitForExit(3000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    }
     foreach ($s in $scenarios) {
         if (-not $s.Child.HasExited) {
             $s.Killed = $true
@@ -1727,6 +1732,7 @@ try {
     }
 }
 
+try {
 foreach ($s in $scenarios) {
     $label = "real " + $s.Name + ": "
     if ($null -ne $s.Skip) { Test-Skip ($label + $s.Skip); continue }
@@ -1789,7 +1795,9 @@ foreach ($s in $scenarios) {
         }
     }
 }
-Remove-Item -LiteralPath $consoleDir -Recurse -Force -ErrorAction SilentlyContinue
+} finally {
+    Remove-Item -LiteralPath $consoleDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
