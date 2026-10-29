@@ -148,8 +148,7 @@ Test-Assert (@($results | Where-Object { $_.Stopped }).Count -eq 2) "in-flight w
 Test-Assert (@($results | Where-Object { $_.TokenSeen }).Count -eq 2) "a declared `$CancelToken parameter receives the run's token"
 Test-Assert ($out.ForceStoppedCount -eq 0) "cooperative workers are not force-stopped"
 Test-Assert ($sw.Elapsed.TotalSeconds -lt 8) ("the run ends promptly after the abort (" + [int]$sw.Elapsed.TotalSeconds + "s)")
-Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Ctrl+C detected*' }).Count -eq 1) "the abort is announced exactly once"
-Test-Assert ([PkConsoleCtrl]::DrainComplete.IsSet) "the native handler thread is released after the drain"
+Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Abort requested*' }).Count -eq 1) "the abort is announced exactly once"
 
 # A worker that ignores the cancel gets force-stopped after the drain timeout.
 Reset-Harness
@@ -716,7 +715,7 @@ Invoke-PkRun -ScriptBlock {
     }
 }.GetNewClosure()
 Test-Assert ($own.Steps -eq 3) "your own loop inside Invoke-PkRun can stop on an abort by polling Test-PkAbortSignal"
-Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Ctrl+C detected*' }).Count -eq 1) "and the abort is announced once"
+Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Abort requested*' }).Count -eq 1) "and the abort is announced once"
 
 # QuickEdit is put back the way it was found.
 Reset-Harness
@@ -1133,7 +1132,7 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try { $null = Invoke-PkProcessWithTimeout -FilePath $pingExe -Arguments '-n 30 127.0.0.1' -TimeoutMs 25000 } catch { $threw = ($_.ToString() -like '*being aborted*') }
 $sw.Stop()
 Test-Assert ($threw -and $sw.Elapsed.TotalSeconds -lt 6) ("Invoke-PkProcessWithTimeout stops its program when the run is aborted (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, time limit was 25s)")
-Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Ctrl+C detected*' }).Count -eq 1) "and the abort is announced"
+Test-Assert (@($script:messages | Where-Object { $_.Message -like '*Abort requested*' }).Count -eq 1) "and the abort is announced"
 $null = $abortTimer.EndInvoke($abortTimerHandle); $abortTimer.Dispose()
 
 # A window close gets no drain, so its announcement mustn't say it waits.
@@ -1389,6 +1388,108 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
     -GroupCompleteCallback { param($g) $called.Count++; $called.SawAbort = [bool](Test-PkCancelRequested) }.GetNewClosure()
 Test-Assert ($d.Aborted -and $called.Count -eq 1 -and $called.SawAbort) "an aborted group still gets its -GroupCompleteCallback, and Test-PkCancelRequested is true inside it"
+Reset-PkAbortState
+Write-Host ""
+
+# ==============================================================================
+Write-Host "=== U: pressing Ctrl+C again ===" -ForegroundColor Cyan
+# [PkConsoleCtrl]::OnInterrupt is what the native handler calls for each
+# Ctrl+C/Ctrl+Break press during a run, so calling it here is a key press
+# minus Windows. Real console events are covered separately.
+
+# The press sequence: start the abort, skip the drain, then let it through.
+Reset-Harness
+[PkConsoleCtrl]::SkipDebounceMs = 0
+try {
+    $presses = @([PkConsoleCtrl]::OnInterrupt('Ctrl+C'), [PkConsoleCtrl]::OnInterrupt('Ctrl+C'), [PkConsoleCtrl]::OnInterrupt('Ctrl+C'))
+} finally {
+    [PkConsoleCtrl]::SkipDebounceMs = 1000
+}
+Test-Assert ($presses[0] -and $presses[1] -and -not $presses[2]) ("the 1st and 2nd presses are handled, the 3rd is passed on to PowerShell (" + ($presses -join ',') + ")")
+Test-Assert ([PkConsoleCtrl]::AbortRequested -and [PkConsoleCtrl]::SkipDrain) "the 1st press starts the abort and the 2nd skips the drain"
+Reset-PkAbortState
+Test-Assert (-not [PkConsoleCtrl]::AbortRequested -and -not [PkConsoleCtrl]::SkipDrain -and $null -eq [PkConsoleCtrl]::PressedKey) "Reset-PkAbortState clears the presses"
+
+# A double tap or a held key only counts once.
+Reset-Harness
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+Test-Assert ([PkConsoleCtrl]::AbortRequested -and -not [PkConsoleCtrl]::SkipDrain) "presses in quick succession count as one"
+
+# The notice names what started the abort, and says how to skip the wait.
+Reset-Harness
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+Break')
+$null = Test-PkAbortSignal
+$notice = @($script:messages | Where-Object { $_.Message -like '*Ctrl+Break detected*Press Ctrl+C again*' })
+Test-Assert ($notice.Count -eq 1 -and (Get-PkAbortTriggerLabel) -eq 'Ctrl+Break') ("Ctrl+Break is announced as Ctrl+Break, with how to skip the wait (label: " + (Get-PkAbortTriggerLabel) + ")")
+Reset-Harness
+Request-PkAbort
+$null = Test-PkAbortSignal
+$notice = @($script:messages | Where-Object { $_.Message -like '*Abort requested*' -and $_.Message -notlike '*Ctrl+C*' })
+Test-Assert ($notice.Count -eq 1 -and (Get-PkAbortTriggerLabel) -eq 'Request-PkAbort') ("an abort from code isn't announced as Ctrl+C (label: " + (Get-PkAbortTriggerLabel) + ")")
+# Once an abort from code is under way, a single press skips the wait.
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+Test-Assert ([PkConsoleCtrl]::SkipDrain) "a press during an abort started from code skips the drain straight away"
+
+# The force-stop notice says why.
+Reset-Harness
+$reasons = @((Get-PkForceStopReason -TimeoutSeconds 5))
+$null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C'); [PkConsoleCtrl]::SkipDrain = $true
+$reasons += Get-PkForceStopReason -TimeoutSeconds 5
+[PkConsoleCtrl]::IsCloseEvent = $true
+$reasons += Get-PkForceStopReason -TimeoutSeconds 5
+Test-Assert ($reasons[0] -like '*within 5s*' -and $reasons[1] -like '*pressed again*' -and $reasons[2] -like '*window is closing*') ("the force-stop notice gives the real reason (" + ($reasons -join ' | ') + ")")
+
+# Presses from another thread while a run waits, as the native handler would.
+function Start-HarnessPresses {
+    $timer = [PowerShell]::Create()
+    $null = $timer.AddScript({
+        [System.Threading.Thread]::Sleep(700);  $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+        [System.Threading.Thread]::Sleep(1800); $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
+    })
+    return @{ PS = $timer; Handle = $timer.BeginInvoke() }
+}
+
+# A batch: the second press cuts the 25s drain short, and the script carries on.
+Reset-Harness
+$presser = Start-HarnessPresses
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$after = @{ Ran = $false }
+$batch = Invoke-PkRun {
+    $b = Invoke-PkProcessBatch -Commands @(1..3 | ForEach-Object { @{ FilePath = $pingExe; Arguments = '-n 15 127.0.0.1' } }) -MaxConcurrent 3 -AbortTimeoutSeconds 25
+    $after.Ran = $true
+    $b
+}.GetNewClosure()
+$sw.Stop()
+$null = $presser.PS.EndInvoke($presser.Handle); $presser.PS.Dispose()
+Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8 -and $after.Ran) ("batch: a second Ctrl+C force-stops running programs straight away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, killed " + $batch.ForceKilledCount + "; the programs run 15s)")
+Test-Assert (@($script:messages | Where-Object { $_.Message -like '*force-stopping 3 job(s) now: Ctrl+C was pressed again*' }).Count -eq 1) "and the force-stop says why"
+
+# Runspace jobs: the same, and the workers are force-stopped.
+Reset-Harness
+$presser = Start-HarnessPresses
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$rsOut = Invoke-PkRun {
+    Invoke-PkRunspaceJobs -MaxParallel 3 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 }, @{ Id = 3 })) -DrainTimeoutSeconds 25 `
+        -WorkerScript { param([int]$Id) for ($i = 0; $i -lt 150; $i++) { [System.Threading.Thread]::Sleep(100) }; $Id }
+}.GetNewClosure()
+$sw.Stop()
+$null = $presser.PS.EndInvoke($presser.Handle); $presser.PS.Dispose()
+Test-Assert ($rsOut.Aborted -and $rsOut.ForceStoppedCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8) ("runspace jobs: a second Ctrl+C force-stops running workers straight away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, stopped " + $rsOut.ForceStoppedCount + "; the workers run 15s)")
+
+# The handler thread a window close parks stays parked until the run ends,
+# not just the drain, so the rest of the run gets Windows' few seconds.
+Reset-Harness
+$parked = @{ AfterDrain = $null }
+$poll = @{ Count = 0 }
+Invoke-PkRun {
+    $null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 })) `
+        -WorkerScript { param([int]$Id) for ($i = 0; $i -lt 100; $i++) { if (Test-PkCancelRequested) { break }; [System.Threading.Thread]::Sleep(50) }; $Id } `
+        -PollCallback { $poll.Count++; if ($poll.Count -eq 3) { Request-PkAbort } }.GetNewClosure()
+    $parked.AfterDrain = [PkConsoleCtrl]::DrainComplete.IsSet
+}.GetNewClosure()
+Test-Assert ($parked.AfterDrain -eq $false -and [PkConsoleCtrl]::DrainComplete.IsSet) ("the handler thread is released when the run ends, not when the drain does (set after drain: " + $parked.AfterDrain + ")")
 Reset-PkAbortState
 Write-Host ""
 

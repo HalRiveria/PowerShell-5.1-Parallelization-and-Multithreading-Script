@@ -51,9 +51,21 @@ public static class PkConsoleCtrl
     // Ctrl+C and closing the window behave exactly as they normally would.
     public static volatile bool RunActive = false;
 
-    // The handler parks on this until the main thread finishes draining.
+    // On a window close, logoff or shutdown the handler parks on this until
+    // the run ends: the process dies as soon as the handler returns, and
+    // Windows ends it after a few seconds anyway. Ctrl+C never parks.
     public static readonly ManualResetEventSlim DrainComplete = new ManualResetEventSlim(false);
-    public static int DrainWaitMs = 65000;   // keep above the drain timeout you use
+    public static int DrainWaitMs = 65000;
+
+    // Ctrl+C presses: the first starts the abort, the next skips the drain
+    // (force-stops running jobs now), the one after that is let through to
+    // PowerShell, which stops the script. A press within SkipDebounceMs of
+    // the last counted one is a double tap or key repeat, and is ignored.
+    public static volatile bool SkipDrain = false;
+    public static volatile string PressedKey = null;   // "Ctrl+C" / "Ctrl+Break" once a press started the abort
+    public static int SkipDebounceMs = 1000;
+    private static long _lastPressTimestamp = 0;
+    private static readonly object _pressLock = new object();
 
     private static HandlerRoutine _handler;   // strong ref so the GC can't collect it
     public static bool LastRegisterSucceeded = false;
@@ -71,16 +83,59 @@ public static class PkConsoleCtrl
     {
         // 0=CTRL_C, 1=CTRL_BREAK, 2=CTRL_CLOSE, 5=CTRL_LOGOFF, 6=CTRL_SHUTDOWN
         if (!RunActive) { return false; }
-        if (ctrlType == 0 || ctrlType == 1 || ctrlType == 2 || ctrlType == 5 || ctrlType == 6)
+        if (ctrlType == 0 || ctrlType == 1)
+        {
+            // Never park here: Windows delivers one console event at a time, so
+            // a parked Ctrl+C would hold back the next press and a window close.
+            return OnInterrupt(ctrlType == 1 ? "Ctrl+Break" : "Ctrl+C");
+        }
+        if (ctrlType == 2 || ctrlType == 5 || ctrlType == 6)
         {
             // IsCloseEvent BEFORE AbortRequested: a poller that sees
             // AbortRequested must already see the right IsCloseEvent.
-            IsCloseEvent   = (ctrlType == 2 || ctrlType == 5 || ctrlType == 6);
+            IsCloseEvent   = true;
             AbortRequested = true;
             DrainComplete.Wait(DrainWaitMs);
             return true;   // suppress the default OS action
         }
         return false;
+    }
+
+    // One Ctrl+C/Ctrl+Break press during a run. Public so tests can press it.
+    // true = handled here; false = let PowerShell's own Ctrl+C stop the script.
+    public static bool OnInterrupt(string key)
+    {
+        lock (_pressLock)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!AbortRequested)
+            {
+                PressedKey = key;
+                _lastPressTimestamp = now;
+                AbortRequested = true;
+                return true;
+            }
+            // An abort is already under way (this press, Request-PkAbort or a
+            // close). A press that follows a counted one too closely is ignored.
+            if (_lastPressTimestamp != 0)
+            {
+                double sinceLastMs = (now - _lastPressTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                if (sinceLastMs < SkipDebounceMs) { return true; }
+            }
+            _lastPressTimestamp = now;
+            if (!SkipDrain) { SkipDrain = true; return true; }
+            return false;
+        }
+    }
+
+    public static void ResetPresses()
+    {
+        lock (_pressLock)
+        {
+            SkipDrain = false;
+            PressedKey = null;
+            _lastPressTimestamp = 0;
+        }
     }
 }
 
@@ -108,7 +163,7 @@ public static class PkState
     // an old session would silently run the OLD C# - the check after the
     // type definitions catches that. That check compares against this
     // number too; bump both together.
-    public const int TypesVersion = 3;
+    public const int TypesVersion = 4;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -283,7 +338,7 @@ public static class PkChildProcessJob
 # compiled types, and they can't be replaced. Say so, instead of failing
 # later with a missing-method error somewhere unrelated. Keep this number
 # in sync with [PkState]::TypesVersion above.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 3) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 4) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -471,6 +526,7 @@ function Reset-PkAbortState {
     [PkState]::CloseAbort   = $false
     [PkConsoleCtrl]::AbortRequested = $false
     [PkConsoleCtrl]::IsCloseEvent   = $false
+    [PkConsoleCtrl]::ResetPresses()
     [PkConsoleCtrl]::DrainComplete.Reset()
 }
 
@@ -500,11 +556,16 @@ function Test-PkAbortSignal {
         foreach ($cts in [PkState]::SnapshotSources()) {
             try { $cts.Cancel() } catch { }   # an already-disposed source has nothing left to cancel
         }
-        $abortMessage = if (-not [PkState]::CloseAbort) {
-            "[ABORT] Ctrl+C detected - finishing current jobs, please wait..."
-        } else {
+        $pressedKey = [PkConsoleCtrl]::PressedKey
+        $abortMessage = if ([PkState]::CloseAbort) {
             # No drain on a close: Windows ends the process within seconds.
             "[ABORT] Window close detected - stopping current jobs now..."
+        } elseif ($null -ne $pressedKey) {
+            "[ABORT] " + $pressedKey + " detected - finishing current jobs, please wait... Press Ctrl+C again to stop them now."
+        } elseif ([PkConsoleCtrl]::RunActive) {
+            "[ABORT] Abort requested - finishing current jobs, please wait... Press Ctrl+C to stop them now."
+        } else {
+            "[ABORT] Abort requested - finishing current jobs, please wait..."
         }
         Invoke-PkMessageHandler -Message $abortMessage -Level Warn
     }
@@ -526,11 +587,22 @@ function Test-PkCancelRequested {
 
 function Get-PkAbortTriggerLabel {
     # .SYNOPSIS
-    # Says what started the abort: "Ctrl+C" or "window close (X button)".
+    # Says what started the abort: "Ctrl+C", "Ctrl+Break", "window close (X button)",
+    # or "Request-PkAbort" for an abort started from code.
     # .OUTPUTS
     # [string]
     if ([PkState]::CloseAbort) { return "window close (X button)" }
-    return "Ctrl+C"
+    $pressedKey = [PkConsoleCtrl]::PressedKey
+    if ($null -ne $pressedKey) { return $pressedKey }
+    return "Request-PkAbort"
+}
+
+function Get-PkForceStopReason {
+    # Why an abort is force-stopping jobs, for the engines' force-stop notice.
+    param([int]$TimeoutSeconds)
+    if ([PkConsoleCtrl]::IsCloseEvent) { return " now: the window is closing" }
+    if ([PkConsoleCtrl]::SkipDrain)    { return " now: Ctrl+C was pressed again" }
+    return (" that did not finish within " + $TimeoutSeconds + "s")
 }
 
 function Complete-PkAbortDrain {
@@ -555,7 +627,8 @@ function Invoke-PkRun {
     # the kit's engines watch: no new work starts, running work gets time to finish,
     # and whatever is left is then stopped. A long step of your own in here must
     # check Test-PkAbortSignal now and then and stop when it's true, or Ctrl+C will
-    # seem to do nothing until that step ends. Closing the window skips the wait.
+    # seem to do nothing until that step ends. Pressing Ctrl+C again, or closing the
+    # window, skips the wait; a third press stops the script as Ctrl+C normally does.
     #
     # For the length of the run it also keeps the PC from idle-sleeping and turns off
     # the console's QuickEdit mode. Whatever the block outputs is passed through.
@@ -1301,7 +1374,7 @@ function Invoke-PkProcessDispatchCore {
     if ($CancelToken.IsCancellationRequested -and $running.Count -gt 0) {
         try {
             $abortDeadline = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($running.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and $abortDeadline.Elapsed.TotalSeconds -lt $AbortTimeoutSeconds) {
+            while ($running.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $abortDeadline.Elapsed.TotalSeconds -lt $AbortTimeoutSeconds) {
                 # ---- BLOCK: graceful-wait loop ---- (keep in sync with the
                 # main poll pass above and the final pass below)
                 $stillWaiting = [System.Collections.Generic.List[hashtable]]::new()
@@ -1405,7 +1478,7 @@ function Invoke-PkProcessDispatchCore {
 
             if ($running.Count -gt 0) {
                 $dispatchResult.ForceKilledCount = $running.Count
-                Write-PkMessage ("ProcessDispatch: force-stopping " + $running.Count + " job(s) that did not finish within " + $AbortTimeoutSeconds + "s.") -Level Warn
+                Write-PkMessage ("ProcessDispatch: force-stopping " + $running.Count + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $AbortTimeoutSeconds) + ".") -Level Warn
                 Stop-PkJobProcesses -Jobs $running
                 foreach ($job in $running) {
                     try { if ($job['Proc']) { $null = $job['Proc'].WaitForExit(5000) } } catch { }
@@ -1487,7 +1560,7 @@ function Invoke-PkProcessBatch {
     # optionally, WorkingDirectory, OutputEncoding (overrides -OutputEncoding) and
     # any keys of your own, which come back on the result's Command. Inside
     # Invoke-PkRun, Ctrl+C lets running programs finish (up to -AbortTimeoutSeconds)
-    # and starts no new ones.
+    # and starts no new ones; a second Ctrl+C kills them straight away.
     # .PARAMETER Commands
     # The command hashtables. $null or empty returns no results.
     # .PARAMETER MaxConcurrent
@@ -1612,7 +1685,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason')
 }
 
 function Receive-PkCompletedHandles {
@@ -1648,8 +1721,9 @@ function Receive-PkCompletedHandles {
 
 function Invoke-PkGracefulDrain {
     # After an abort: give running workers $TimeoutSeconds to finish, collect
-    # what they return, force-stop the rest. Always releases the native
-    # handler thread, even if something in here throws.
+    # what they return, force-stop the rest. Leaves the native handler thread
+    # parked: on a window close it's released when Invoke-PkRun ends, so the
+    # rest of the run still gets the few seconds Windows allows.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -1661,7 +1735,6 @@ function Invoke-PkGracefulDrain {
     )
 
     if ($Handles.Count -eq 0) {
-        Complete-PkAbortDrain
         return @{ ForceStoppedCount = 0 }
     }
 
@@ -1674,35 +1747,31 @@ function Invoke-PkGracefulDrain {
     $abortDeadline = [System.Diagnostics.Stopwatch]::StartNew()
     $forceStoppedCount = 0
 
-    try {
-        if ($AbortWaitMessage -ne "") { Invoke-PkMessageHandler -Message $AbortWaitMessage -Level Warn }
+    if ($AbortWaitMessage -ne "") { Invoke-PkMessageHandler -Message $AbortWaitMessage -Level Warn }
 
-        while ($localHandles.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and $abortDeadline.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-            $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
-            Receive-PkWorkerMessages -Queue $MessageQueue
-            if ($localHandles.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
-        }
-
-        # One final pass before declaring anything force-stopped.
-        if ($localHandles.Count -gt 0) {
-            $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
-            Receive-PkWorkerMessages -Queue $MessageQueue
-        }
-
-        if ($localHandles.Count -gt 0) {
-            $forceStoppedCount = $localHandles.Count
-            Invoke-PkMessageHandler -Level Error -Message ("[ABORT] Force-stopping " + $forceStoppedCount + " job(s) that did not finish within " + $TimeoutSeconds + "s.")
-            foreach ($h in $localHandles) {
-                # BeginStop, not Stop: Stop() blocks until the pipeline
-                # actually unwinds, and a worker stuck in a .NET call never does.
-                try { $null = $h.PS.BeginStop($null, $null) } catch { }
-            }
-        }
-
+    while ($localHandles.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $abortDeadline.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
         Receive-PkWorkerMessages -Queue $MessageQueue
-    } finally {
-        Complete-PkAbortDrain
+        if ($localHandles.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
     }
+
+    # One final pass before declaring anything force-stopped.
+    if ($localHandles.Count -gt 0) {
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -ErrorHandler $errorHandler
+        Receive-PkWorkerMessages -Queue $MessageQueue
+    }
+
+    if ($localHandles.Count -gt 0) {
+        $forceStoppedCount = $localHandles.Count
+        Invoke-PkMessageHandler -Level Error -Message ("[ABORT] Force-stopping " + $forceStoppedCount + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $TimeoutSeconds) + ".")
+        foreach ($h in $localHandles) {
+            # BeginStop, not Stop: Stop() blocks until the pipeline
+            # actually unwinds, and a worker stuck in a .NET call never does.
+            try { $null = $h.PS.BeginStop($null, $null) } catch { }
+        }
+    }
+
+    Receive-PkWorkerMessages -Queue $MessageQueue
 
     return @{ ForceStoppedCount = $forceStoppedCount }
 }

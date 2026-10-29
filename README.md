@@ -276,6 +276,8 @@ Inside `Invoke-PkRun { ... }`, Ctrl+C:
 3. waits for in-flight work (`-DrainTimeoutSeconds` / `-AbortTimeoutSeconds`, default 60),
 4. force-stops whatever is left, calling `-JobAbortCleanup` for each killed or never-started process job.
 
+Press Ctrl+C again to skip step 3: whatever is still running is force-stopped straight away, and your script carries on. A third press stops the script the way Ctrl+C normally does. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
+
 Closing the window does the same minus step 3: Windows allows only a few seconds, so leftovers are stopped straight away.
 
 Three things to know:
@@ -344,7 +346,7 @@ As a module it couldn't find the functions you list in `-SharedFunctionNames`, s
 
 **What happens to running programs when I press Ctrl+C?**
 
-Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. See [Abort](#abort).
+Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. Press Ctrl+C again to kill them straight away instead of waiting. See [Abort](#abort).
 
 **And if the script is killed outright, from Task Manager say?**
 
