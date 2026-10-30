@@ -351,10 +351,6 @@ PowerShell 7 on Windows, yes: Windows PowerShell 5.1 is the main target, but the
 
 No. Nothing it does needs elevation.
 
-**Is it a module?**
-
-It is. Dot-sourcing the file loads it as an in-memory module, so there's nothing to install and nothing on `$env:PSModulePath`. The functions you list in `-SharedFunctionNames` are found from wherever you call the kit: a script's own functions, functions inside a function, or a module's private functions. You keep one file at a known version, which you can copy into a project even on machines where installing modules isn't allowed.
-
 **What happens to running programs when I press Ctrl+C?**
 
 Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. Press Ctrl+C again to kill them straight away instead of waiting. See [Abort](#abort).
