@@ -5,7 +5,7 @@
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
-# Use:   . "<path>\ParallelKit.ps1"     (dot-source it; do NOT Import-Module it)
+# Use:   . "<path>\ParallelKit.ps1"     (dot-source it; it loads itself as an in-memory module)
 # Read README.md first - the two worker-code rules there are what keep this
 # from hanging or crashing.
 #
@@ -24,6 +24,17 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
         "(it compiles C# with Add-Type). This is usually set by AppLocker or Windows Defender Application Control policy. " +
         "Ask whoever manages the machine to allow this script, or run it where that policy doesn't apply.")
 }
+
+# Everything below loads as an in-memory module named ParallelKit. The kit's
+# own frames then live in the module's session state, so a callback you pass
+# in sees your variables, never the kit's locals, and the internal helpers
+# stay out of your session. The public functions are imported globally, so
+# they work from any .GetNewClosure() block and for the rest of the session.
+# A copy loaded earlier in this session is dropped first, so only one is
+# listed. -ErrorAction Stop: without it, a throw in the module body (the
+# stale-types check below, say) wouldn't stop the script that loads the kit.
+Get-Module -Name ParallelKit | Remove-Module
+New-Module -Name ParallelKit -ErrorAction Stop -ScriptBlock {
 
 # ==============================================================================
 #  Native types (guarded so the file can be dot-sourced more than once)
@@ -632,10 +643,6 @@ function Invoke-PkRun {
     #
     # For the length of the run it also keeps the PC from idle-sleeping and turns off
     # the console's QuickEdit mode. Whatever the block outputs is passed through.
-    #
-    # The block runs inside this function, so a variable of yours named $ScriptBlock,
-    # $KeepAwake or $DisableQuickEdit reads this function's value instead.
-    # Add .GetNewClosure() to the block if that could happen.
     # .PARAMETER ScriptBlock
     # The work to run.
     # .PARAMETER DisableQuickEdit
@@ -1669,6 +1676,9 @@ function Invoke-PkProcessBatch {
 
     $results = [System.Collections.Generic.List[object]]::new()
     $state   = @{ Given = $false }
+    # The closures below can't see the module's private functions (a
+    # .GetNewClosure() block only sees global ones), so take this one along.
+    $pkNewBatchResult = ${function:New-PkBatchResult}
 
     $groupProvider = {
         if ($state.Given) { return $null }
@@ -1693,7 +1703,7 @@ function Invoke-PkProcessBatch {
         try {
             $started = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments'] -WorkingDirectory $job['WorkingDirectory'] -OutputEncoding $job['OutputEncoding']
         } catch {
-            $results.Add((New-PkBatchResult -Command $job['Command'] -StartError ([string]$_)))
+            $results.Add((& $pkNewBatchResult -Command $job['Command'] -StartError ([string]$_)))
             throw
         }
         $job['Proc'] = $started.Proc; $job['StdoutTask'] = $started.StdoutTask; $job['StderrTask'] = $started.StderrTask
@@ -1703,7 +1713,7 @@ function Invoke-PkProcessBatch {
 
     $jobFinalize = {
         param($job, $pendingQueue)
-        $r = New-PkBatchResult -Command $job['Command'] -Completed (Complete-PkProcess -Job $job) -TimedOut ([bool]$job['TimedOut'])
+        $r = & $pkNewBatchResult -Command $job['Command'] -Completed (Complete-PkProcess -Job $job) -TimedOut ([bool]$job['TimedOut'])
         $results.Add($r)
         if ($null -ne $OnComplete) { $null = & $OnComplete $job['Command'] $r }
         return @{ Success = ($r.ExitCode -eq 0) }
@@ -1711,7 +1721,7 @@ function Invoke-PkProcessBatch {
 
     $jobAbortCleanup = {
         param($job)
-        $results.Add((New-PkBatchResult -Command $job['Command'] -Aborted))
+        $results.Add((& $pkNewBatchResult -Command $job['Command'] -Aborted))
     }.GetNewClosure()
 
     $dispatchParams = @{
@@ -1765,8 +1775,8 @@ function Get-PkHandlerParamCount {
 function Add-PkCrashedJob {
     # A worker threw: count it, record it with its job on the run's outcome,
     # announce it, and tell -JobCrashedHandler. Shared by the main loop and
-    # the abort drain. pk-prefixed parameters: a handler built without
-    # .GetNewClosure() can see them.
+    # the abort drain. pk-prefixed parameters: when the kit was dot-sourced
+    # rather than a module, a handler built without .GetNewClosure() saw them.
     param(
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$PkOutcome,
         [hashtable]$PkJob,
@@ -1801,10 +1811,10 @@ function Receive-PkCompletedHandles {
     $stillActive = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($h in $Handles) {
         if ($h.Handle.IsCompleted) {
-            # Not $results: a -ResultHandler built without .GetNewClosure() sees
-            # this function's locals, and $results.Add($r) there would grow the
-            # collection this loop walks, so it never ends. Same in
-            # Invoke-PkRunspaceJobs.
+            # Not $results: when the kit was dot-sourced rather than a module, a
+            # -ResultHandler built without .GetNewClosure() saw this function's
+            # locals, and $results.Add($r) there grew the collection this loop
+            # walks, so it never ended. Same in Invoke-PkRunspaceJobs.
             $pkWorkerOutput = $null
             try {
                 $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
@@ -1982,7 +1992,7 @@ function Invoke-PkRunspaceJobs {
     if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return [pscustomobject]$outcome }
 
     if ($CheckWorkerSafety) {
-        $safetyFindings = Test-PkWorkerSafety -WorkerScript $WorkerScript -SharedFunctionNames $SharedFunctionNames
+        $safetyFindings = Test-PkWorkerSafetyCore -WorkerScript $WorkerScript -SharedFunctionNames $SharedFunctionNames -SessionState $PSCmdlet.SessionState
         if ($safetyFindings.Count -gt 0) {
             $safetyLines = foreach ($f in $safetyFindings) { "  " + $f.Text }
             throw ("Invoke-PkRunspaceJobs: worker code breaks the worker-safety rules (see README.md):`r`n" + ($safetyLines -join "`r`n"))
@@ -2039,13 +2049,19 @@ function Invoke-PkRunspaceJobs {
         $allShared = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($n in (Get-PkWorkerSafeFunctionNames)) { $null = $allShared.Add($n) }
         foreach ($n in $SharedFunctionNames)            { $null = $allShared.Add($n) }
+        # The kit's worker functions come from this module; yours from where
+        # you called this (a script's own functions, functions inside a
+        # function, a module's private ones).
+        $kitWorkerNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-PkWorkerSafeFunctionNames), [System.StringComparer]::OrdinalIgnoreCase)
+        $callerFns = Get-PkCallerFunction -SessionState $PSCmdlet.SessionState -Name @($allShared | Where-Object { -not $kitWorkerNames.Contains($_) })
         foreach ($sharedFn in $allShared) {
-            try {
-                $fnDef = (Get-Item ("Function:\" + $sharedFn) -ErrorAction Stop).Definition
-            } catch {
-                throw ("Invoke-PkRunspaceJobs: -SharedFunctionNames entry '" + $sharedFn + "' does not resolve to a defined function - check for a typo, or that the file defining it was dot-sourced before this call. Original error: " + $_)
+            $fnInfo = $null
+            if ($kitWorkerNames.Contains($sharedFn)) { $fnInfo = Get-Item -LiteralPath ("Function:\" + $sharedFn) -ErrorAction SilentlyContinue }
+            else { $fnInfo = $callerFns[$sharedFn] }
+            if ($null -eq $fnInfo) {
+                throw ("Invoke-PkRunspaceJobs: -SharedFunctionNames entry '" + $sharedFn + "' does not resolve to a defined function - check for a typo, or that the file defining it was dot-sourced before this call.")
             }
-            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($sharedFn, $fnDef))
+            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($sharedFn, $fnInfo.Definition))
         }
         # Global variables in every worker runspace: how kit functions know
         # they're in a worker, and where they find the run's token.
@@ -2128,10 +2144,11 @@ function Invoke-PkRunspaceJobs {
             $stillPending = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($h in $handles) {
                 if ($h.Handle.IsCompleted) {
-                    # Not $results: a -ResultHandler or -JobCrashedHandler built
-                    # without .GetNewClosure() sees this function's locals, and
-                    # $results.Add($r) there would grow the collection this loop
-                    # walks, so it never ends. Same in Receive-PkCompletedHandles.
+                    # Not $results: when the kit was dot-sourced rather than a
+                    # module, a -ResultHandler or -JobCrashedHandler built without
+                    # .GetNewClosure() saw this function's locals, and
+                    # $results.Add($r) there grew the collection this loop
+                    # walks, so it never ended. Same in Receive-PkCompletedHandles.
                     $pkWorkerOutput = $null
                     try {
                         $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
@@ -2205,24 +2222,73 @@ function Invoke-PkRunspaceJobs {
 #  Worker-safety check (see README.md, "The two rules")
 # ==============================================================================
 
-function Get-PkCommandKind {
-    # What a worker would need to run $Name: 'Function' (one of your session's
-    # functions - must be shared), 'UnloadableModuleFunction' (from a module a
-    # worker can't autoload), or 'Other' (cmdlet, program, autoloadable module
-    # function, or unknown). Reads the Alias: and Function: drives directly:
-    # Get-Command on a name that doesn't resolve searches every module on
-    # $env:PSModulePath, and the check runs on every Invoke-PkRunspaceJobs call.
-    param([string]$Name)
-    $hops = 0
-    $alias = Get-Item -LiteralPath ("Alias:\" + $Name) -ErrorAction SilentlyContinue
-    while ($null -ne $alias -and $hops -lt 5) {
-        $Name = $alias.Definition
-        $alias = Get-Item -LiteralPath ("Alias:\" + $Name) -ErrorAction SilentlyContinue
-        $hops++
+function Get-PkCallerFunction {
+    # Looks function names up in the CALLER's session state, from the caller's
+    # current scope: a script's own functions (.\script.ps1), functions
+    # defined inside the calling function, a calling module's private ones.
+    # Get-Item Function: here would search this module (plus global), and
+    # SessionState.InvokeCommand.GetCommand only finds global functions.
+    # An unbound scriptblock (made from text) run with InvokeScript(SessionState)
+    # runs in that session state, dot-sourced into the caller's current scope.
+    # So the work happens inside & { } and the names are embedded as quoted
+    # literals: nothing is assigned in the caller's scope.
+    # With -FollowAlias, an alias is followed to the function it points at.
+    # Returns a hashtable: requested name -> FunctionInfo (missing = not found).
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.SessionState]$SessionState,
+        [string[]]$Name,
+        [switch]$FollowAlias
+    )
+    $found = @{}
+    $names = @($Name | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    if ($names.Count -eq 0) { return $found }
+    $q = [string][char]39
+    $quoted = foreach ($n in $names) { $q + $n.Replace($q, $q + $q) + $q }
+    $follow = '$false'
+    if ($FollowAlias) { $follow = '$true' }
+    $text = @'
+& {
+    foreach ($pkName in @(__NAMES__)) {
+        $pkCmd = $pkName
+        if (__FOLLOW__) {
+            $pkHops = 0
+            $pkAlias = Get-Item -LiteralPath ('Alias:' + $pkCmd) -ErrorAction SilentlyContinue
+            while ($null -ne $pkAlias -and $pkHops -lt 5) {
+                $pkCmd = $pkAlias.Definition
+                $pkAlias = Get-Item -LiteralPath ('Alias:' + $pkCmd) -ErrorAction SilentlyContinue
+                $pkHops++
+            }
+        }
+        $pkFn = Get-Item -LiteralPath ('Function:' + $pkCmd) -ErrorAction SilentlyContinue
+        if ($null -ne $pkFn) { [pscustomobject]@{ Name = $pkName; Fn = $pkFn } }
     }
-    $fn = Get-Item -LiteralPath ("Function:\" + $Name) -ErrorAction SilentlyContinue
+}
+'@
+    $text = $text.Replace('__NAMES__', ($quoted -join ', ')).Replace('__FOLLOW__', $follow)
+    $lookup = [scriptblock]::Create($text)
+    foreach ($hit in $ExecutionContext.InvokeCommand.InvokeScript($SessionState, $lookup, @())) {
+        $found[[string]$hit.Name] = $hit.Fn
+    }
+    return $found
+}
+
+function Get-PkCommandKind {
+    # What a worker would need to run a command, given what the caller's
+    # session resolves its name to ($Fn from Get-PkCallerFunction -FollowAlias,
+    # or $null): 'Function' (one of your session's functions - must be
+    # shared), 'UnloadableModuleFunction' (from a module a worker can't
+    # autoload), or 'Other' (cmdlet, program, autoloadable module function,
+    # or unknown). Works from the Alias: and Function: drives rather than
+    # Get-Command: Get-Command on a name that doesn't resolve searches every
+    # module on $env:PSModulePath, and the check runs on every
+    # Invoke-PkRunspaceJobs call.
+    param([System.Management.Automation.FunctionInfo]$Fn)
+    $fn = $Fn
     if ($null -eq $fn) { return 'Other' }
     if ([string]::IsNullOrEmpty($fn.ModuleName)) { return 'Function' }
+    # The kit's own: a worker gets only the worker-safe ones, so treat the
+    # rest like a function of yours (needs listing), as before the kit was a module.
+    if ($fn.ModuleName -eq 'ParallelKit') { return 'Function' }
     # A module function (Get-FileHash, say) autoloads in a worker like a
     # cmdlet does - but only if the module can be found by name. One imported
     # by path from elsewhere can't.
@@ -2319,6 +2385,18 @@ function Test-PkWorkerSafety {
         [scriptblock]$WorkerScript,
         [string[]]$SharedFunctionNames = @()
     )
+    # Your functions are looked up where you called this from.
+    return ,(Test-PkWorkerSafetyCore -WorkerScript $WorkerScript -SharedFunctionNames $SharedFunctionNames -SessionState $PSCmdlet.SessionState)
+}
+
+function Test-PkWorkerSafetyCore {
+    # Test-PkWorkerSafety's body. -SessionState is the caller's, for finding
+    # their functions (Invoke-PkRunspaceJobs passes its own caller's).
+    param(
+        [Parameter(Mandatory)][scriptblock]$WorkerScript,
+        [string[]]$SharedFunctionNames = @(),
+        [Parameter(Mandatory)][System.Management.Automation.SessionState]$SessionState
+    )
 
     $findings = [System.Collections.Generic.List[object]]::new()
     $kitNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-PkWorkerSafeFunctionNames), [System.StringComparer]::OrdinalIgnoreCase)
@@ -2329,9 +2407,10 @@ function Test-PkWorkerSafety {
     # What to check: the worker body, plus every shared function of yours.
     $targets = [System.Collections.Generic.List[hashtable]]::new()
     $targets.Add(@{ Where = 'worker script'; Ast = $WorkerScript.Ast; IsWorkerBody = $true })
+    $callerFns = Get-PkCallerFunction -SessionState $SessionState -Name @($SharedFunctionNames | Where-Object { -not $kitNames.Contains($_) })
     foreach ($n in $SharedFunctionNames) {
         if ($kitNames.Contains($n)) { continue }
-        $fn = Get-Item ("Function:\" + $n) -ErrorAction SilentlyContinue
+        $fn = $callerFns[$n]
         if ($null -eq $fn) {
             $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = '-SharedFunctionNames'; Line = 0; Text = ("-SharedFunctionNames lists '" + $n + "', which is not a defined function") })
             continue
@@ -2339,6 +2418,16 @@ function Test-PkWorkerSafety {
         $targets.Add(@{ Where = ("function " + $n); Ast = $fn.ScriptBlock.Ast; IsWorkerBody = $false })
     }
 
+    # Every command name the code calls, resolved in the caller's session in
+    # one lookup rather than one per name.
+    $cmdNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in $targets) {
+        foreach ($c in $t.Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $cmdName = $c.GetCommandName()
+            if ($cmdName) { $null = $cmdNames.Add($cmdName) }
+        }
+    }
+    $resolvedFns = Get-PkCallerFunction -SessionState $SessionState -Name @($cmdNames) -FollowAlias
     $kindCache = @{}
     foreach ($t in $targets) {
         $ast = $t.Ast
@@ -2347,7 +2436,16 @@ function Test-PkWorkerSafety {
             $cmdName = $c.GetCommandName()
             if (-not $cmdName) { continue }
             if ($c.Extent.StartScriptPosition.Line -match '#\s*pk:ignore') { continue }
-            if (-not $kindCache.ContainsKey($cmdName)) { $kindCache[$cmdName] = Get-PkCommandKind -Name $cmdName }
+            if (-not $kindCache.ContainsKey($cmdName)) {
+                $fnForKind = $resolvedFns[$cmdName]
+                if ($null -eq $fnForKind) {
+                    # One of the kit's private helpers: invisible to the caller,
+                    # but a worker can't run it unless it's worker-safe either.
+                    $ownFn = Get-Item -LiteralPath ('Function:' + $cmdName) -ErrorAction SilentlyContinue
+                    if ($null -ne $ownFn -and $ownFn.ModuleName -eq 'ParallelKit') { $fnForKind = $ownFn }
+                }
+                $kindCache[$cmdName] = Get-PkCommandKind -Fn $fnForKind
+            }
             $kind = $kindCache[$cmdName]
             if ($kind -eq 'Function' -and -not $listed.Contains($cmdName)) {
                 $findings.Add([pscustomobject][ordered]@{ Rule = 'MissingFunction'; Where = $t.Where; Line = $c.Extent.StartLineNumber
@@ -2435,23 +2533,19 @@ function Test-PkWorkerSafety {
 }
 
 # ==============================================================================
-#  Make the kit's functions global
+#  Public functions (the ones README.md documents)
 # ==============================================================================
 
-# Dot-sourced inside a script run from a prompt (.\script.ps1 or & script),
-# the functions above exist only in that script's scope. A .GetNewClosure()
-# block - the batch's own callbacks, or yours - can only see global
-# functions, so it couldn't find them. Defining each one globally too means
-# kit functions work from any closure, however the script was started.
-# Only the kit's own functions (Pk-named, plus Initialize-ParallelKit): the
-# kit may be pasted into a larger script whose other functions are none of
-# its business. Run in a child scope so the loop's variables don't touch
-# the caller's.
-& {
-    param($kitAst)
-    foreach ($fnAst in $kitAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-        if ($fnAst.Name -notlike '*-Pk*' -and $fnAst.Name -ne 'Initialize-ParallelKit') { continue }
-        $fn = Get-Item -LiteralPath ("Function:\" + $fnAst.Name) -ErrorAction SilentlyContinue
-        if ($null -ne $fn) { $null = Set-Item -Path ("Function:\global:" + $fnAst.Name) -Value $fn.ScriptBlock }
-    }
-} $MyInvocation.MyCommand.ScriptBlock.Ast
+# Imported globally (Import-Module -Global below): a .GetNewClosure() block
+# can only see global functions, so this is what lets the batch's own
+# callbacks, and yours, call them however your script was started.
+# The same list is $publicFunctions in ParallelKit.Harness.ps1 (which checks
+# each has Get-Help help and is visible); keep the two in step.
+Export-ModuleMember -Function @(
+    'Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
+    'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',
+    'Get-PkAbortTriggerLabel', 'Invoke-PkRun', 'ConvertTo-PkArgumentString', 'Start-PkProcess', 'Stop-PkProcessTree',
+    'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout', 'Invoke-PkProcessDispatch', 'Invoke-PkProcessBatch',
+    'Invoke-PkRunspaceJobs', 'Test-PkWorkerSafety')
+
+} | Import-Module -Global

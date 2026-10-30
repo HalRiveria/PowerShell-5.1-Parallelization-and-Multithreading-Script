@@ -283,7 +283,7 @@ if ($compiled) {
     Test-Assert ($byName['default'] -eq $u8Text -and $byName['own'] -ne $u8Text) "batch: -OutputEncoding applies to every command, and a command's own OutputEncoding key overrides it"
     try { [System.IO.File]::Delete($u8Exe) } catch { }  # temp file only; best effort
 }
-Test-Assert ((Resolve-PkEncoding -Encoding '437').CodePage -eq 437) "a code page given as text ('437') is accepted"
+Test-Assert ((& (Get-Module ParallelKit) Resolve-PkEncoding -Encoding '437').CodePage -eq 437) "a code page given as text ('437') is accepted"
 # -OutputEncoding mustn't replace PowerShell's own $OutputEncoding inside the
 # caller's callbacks.
 $seen = @{ Value = 'unset' }
@@ -503,7 +503,8 @@ Test-Assert ($leaked -eq $false) "each run starts with a clean abort state"
 Write-Host ""
 
 # Every public function has Get-Help help: a synopsis, and a description for
-# each of its parameters.
+# each of its parameters. The same list is the Export-ModuleMember list at the
+# end of ParallelKit.ps1; keep the two in step.
 $publicFunctions = @('Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
     'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',
     'Get-PkAbortTriggerLabel', 'Invoke-PkRun', 'ConvertTo-PkArgumentString', 'Start-PkProcess', 'Stop-PkProcessTree',
@@ -825,11 +826,11 @@ Remove-Module -Name $modName
 
 # Job-value scan: nested values, typed arrays, and live shared collections.
 $mainThreadBlock = { 1 }
-Test-Assert ((Get-PkScriptBlockJobKey -Job @{ Steps = @(@{ Name = 'a'; Run = $mainThreadBlock }) }) -eq 'Steps') "a scriptblock two levels down in a job value is found"
-Test-Assert ((Get-PkScriptBlockJobKey -Job @{ Opts = [pscustomobject]@{ OnDone = $mainThreadBlock } }) -eq 'Opts') "a scriptblock in a [pscustomobject] property is found"
+Test-Assert ((& (Get-Module ParallelKit) Get-PkScriptBlockJobKey -Job @{ Steps = @(@{ Name = 'a'; Run = $mainThreadBlock }) }) -eq 'Steps') "a scriptblock two levels down in a job value is found"
+Test-Assert ((& (Get-Module ParallelKit) Get-PkScriptBlockJobKey -Job @{ Opts = [pscustomobject]@{ OnDone = $mainThreadBlock } }) -eq 'Opts') "a scriptblock in a [pscustomobject] property is found"
 $bigBytes = [byte[]]::new(20MB)
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$key = Get-PkScriptBlockJobKey -Job @{ Data = $bigBytes; Paths = [string[]]::new(200000) }
+$key = & (Get-Module ParallelKit) Get-PkScriptBlockJobKey -Job @{ Data = $bigBytes; Paths = [string[]]::new(200000) }
 $sw.Stop()
 Test-Assert ($null -eq $key -and $sw.Elapsed.TotalSeconds -lt 1) ("a 20 MB byte[] and a 200k string[] are skipped, not walked (" + [int]$sw.Elapsed.TotalMilliseconds + "ms)")
 $sink = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -840,7 +841,7 @@ $writerHandle = $writer.BeginInvoke()
 $scanError = $null
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 while ($sw.Elapsed.TotalSeconds -lt 3 -and $null -eq $scanError) {
-    try { $null = Get-PkScriptBlockJobKey -Job @{ Sink = $sink } } catch { $scanError = $_ }
+    try { $null = & (Get-Module ParallelKit) Get-PkScriptBlockJobKey -Job @{ Sink = $sink } } catch { $scanError = $_ }
 }
 $null = $writer.BeginStop($null, $null)
 $writer.Dispose()
@@ -868,7 +869,7 @@ Test-Assert ($probeThreads -ge 128) ("and raises the thread pool by itself (mini
 
 # A script run the way a prompt runs it (& script, or .\script.ps1) holds
 # the kit's functions in its own scope, where a .GetNewClosure() block can't
-# see them. The kit makes them global too, so the batch (whose callbacks are
+# see them. The kit's public functions are imported globally, so the batch (whose callbacks are
 # closures) and a caller's closure that calls a kit function both work.
 # Needs a fresh process, started with -Command rather than -File.
 $promptScript = Join-Path $env:TEMP ("pk-prompt-" + [guid]::NewGuid().ToString("N") + ".ps1")
@@ -1486,11 +1487,11 @@ Test-Assert ([PkConsoleCtrl]::SkipDrain) "a press during an abort started from c
 
 # The force-stop notice says why.
 Reset-Harness
-$reasons = @((Get-PkForceStopReason -TimeoutSeconds 5))
+$reasons = @((& (Get-Module ParallelKit) Get-PkForceStopReason -TimeoutSeconds 5))
 $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C'); [PkConsoleCtrl]::SkipDrain = $true
-$reasons += Get-PkForceStopReason -TimeoutSeconds 5
+$reasons += & (Get-Module ParallelKit) Get-PkForceStopReason -TimeoutSeconds 5
 [PkConsoleCtrl]::IsCloseEvent = $true
-$reasons += Get-PkForceStopReason -TimeoutSeconds 5
+$reasons += & (Get-Module ParallelKit) Get-PkForceStopReason -TimeoutSeconds 5
 Test-Assert ($reasons[0] -like '*within 5s*' -and $reasons[1] -like '*pressed again*' -and $reasons[2] -like '*window is closing*') ("the force-stop notice gives the real reason (" + ($reasons -join ' | ') + ")")
 
 # Presses from another thread while a run waits, as the native handler would.
@@ -2021,6 +2022,91 @@ $null = Invoke-PkProcessDispatch -MaxConcurrent 4 `
         }
     }.GetNewClosure()
 Test-Assert ($dispatchSeen.Alive -ge 0 -and $dispatchSeen.Alive -le 15) ("dispatcher: a finished job's output can be freed before its group ends (" + $dispatchSeen.Alive + " of 29 still held)")
+Write-Host ""
+
+# ==============================================================================
+Write-Host "=== Z: the kit loads as an in-memory module ===" -ForegroundColor Cyan
+Reset-Harness
+# Only the public functions are visible, and they come from the module.
+$missingPublic = @($publicFunctions | Where-Object { -not (Get-Command -Name $_ -CommandType Function -ErrorAction SilentlyContinue) })
+$visibleInternal = @('Invoke-PkProcessDispatchCore', 'Add-PkCrashedJob', 'New-PkBatchResult', 'Get-PkCallerFunction' | Where-Object { Get-Command -Name $_ -ErrorAction SilentlyContinue })
+Test-Assert ($missingPublic.Count -eq 0 -and $visibleInternal.Count -eq 0 -and (Get-Command Invoke-PkRun).ModuleName -eq 'ParallelKit') ("only the public functions are visible, from module ParallelKit (missing: " + ($missingPublic -join ', ') + "; internal visible: " + ($visibleInternal -join ', ') + ")")
+
+# A callback built without .GetNewClosure() sees the caller's variables,
+# not ones of the same name inside the kit.
+$results = [System.Collections.Generic.List[object]]::new()
+$state = @{ Count = 0 }
+$TimeoutSeconds = 99
+$sawTimeout = @{ Value = $null }
+$plainBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -OnComplete {
+    param($c, $r)
+    $results.Add('mine')
+    $state.Count++
+    $sawTimeout.Value = $TimeoutSeconds
+}
+$foreign = @($plainBatch.Results | Where-Object { $_ -isnot [System.Management.Automation.PSCustomObject] }).Count
+Test-Assert ($plainBatch.Results.Count -eq 2 -and $foreign -eq 0 -and $results.Count -eq 2 -and $state.Count -eq 2) ("a plain -OnComplete's `$results/`$state are the caller's, not the batch's (batch results " + $plainBatch.Results.Count + ", caller's " + $results.Count + "/" + $state.Count + ")")
+Test-Assert ($sawTimeout.Value -eq 99) ("a plain -OnComplete reads the caller's `$TimeoutSeconds, not the batch's parameter (" + $sawTimeout.Value + ")")
+Remove-Variable -Name TimeoutSeconds
+$outcome = @{}
+$plainJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param([int]$Id) @{ Id = ("job" + $Id) } } -ResultHandler { param($r) $outcome[$r.Id] = 1 }
+$privateCall = @(Test-PkWorkerSafety -WorkerScript { param($N) Invoke-PkMessageHandler -Message 'x' -Level Info })
+Test-Assert ($privateCall.Count -eq 1 -and $privateCall[0].Rule -eq 'MissingFunction') ("worker code calling one of the kit's private helpers is still flagged (" + (@($privateCall | ForEach-Object { $_.Rule }) -join ',') + ")")
+Test-Assert ($outcome.Count -eq 1 -and @($plainJobs.PSObject.Properties).Count -eq 4) ("a plain -ResultHandler writes to the caller's `$outcome, not the kit's return value (caller's " + $outcome.Count + ")")
+$ScriptBlock = 'mine'
+$fromRun = Invoke-PkRun { $ScriptBlock }
+Remove-Variable -Name ScriptBlock
+Test-Assert ($fromRun -eq 'mine') ("Invoke-PkRun's block reads the caller's `$ScriptBlock, not Invoke-PkRun's parameter (" + $fromRun + ")")
+
+# -SharedFunctionNames and Test-PkWorkerSafety find the caller's functions
+# however the script was started. A script run from a prompt (& script)
+# keeps its functions in its own scope, not global, so this needs a fresh
+# process started with -Command.
+$lookupScript = Join-Path $env:TEMP ("pk-lookup-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($lookupScript, @"
+. '$kitPath'
+function Get-LookupDouble { param(`$N) 2 * `$N }
+function Get-LookupState { `$script:lookupState }
+`$out = [System.Collections.Generic.List[object]]::new()
+`$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ N = 3 }) -SharedFunctionNames Get-LookupDouble -WorkerScript { param(`$N) Get-LookupDouble -N `$N } -ResultHandler { param(`$r) `$out.Add(`$r) }.GetNewClosure()
+Write-Output ('script fn=' + (`$out -join ','))
+function Invoke-LookupOuter {
+    function Get-LookupInner { param(`$N) 10 * `$N }
+    `$inner = [System.Collections.Generic.List[object]]::new()
+    `$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ N = 4 }) -SharedFunctionNames Get-LookupInner -WorkerScript { param(`$N) Get-LookupInner -N `$N } -ResultHandler { param(`$r) `$inner.Add(`$r) }.GetNewClosure()
+    Write-Output ('inner fn=' + (`$inner -join ','))
+}
+Invoke-LookupOuter
+Write-Output ('unlisted=' + (@(Test-PkWorkerSafety -WorkerScript { param(`$N) Get-LookupDouble -N `$N }) | ForEach-Object { `$_.Rule }))
+Write-Output ('script var=' + (@(Test-PkWorkerSafety -WorkerScript { param(`$N) Get-LookupState } -SharedFunctionNames Get-LookupState) | ForEach-Object { `$_.Rule }))
+"@)
+$lookup = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $lookupScript + "'"))) -TimeoutMs 60000
+[System.IO.File]::Delete($lookupScript)
+$lookupOut = ([string]$lookup.Stdout + [string]$lookup.Stderr).Trim() -replace '\s+', ' '
+Test-Assert ($lookupOut -match 'script fn=6' -and $lookupOut -match 'inner fn=40') ("in a script run from a prompt, -SharedFunctionNames finds the script's functions and ones defined inside a function (" + $lookupOut + ")")
+Test-Assert ($lookupOut -match 'unlisted=MissingFunction' -and $lookupOut -match 'script var=ScriptVariable') "and Test-PkWorkerSafety still reads their source: unlisted ones and `$script: use are flagged"
+
+# A module's private function can be shared, when the script that loaded
+# the kit calls into that module.
+$modDir = Join-Path $env:TEMP ("pk-harness-mod-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path $modDir
+$modPath = Join-Path $modDir 'PkHarnessMod.psm1'
+[System.IO.File]::WriteAllText($modPath, @'
+function Get-ModPrivate { param($N) 100 + $N }
+function Invoke-ModWork {
+    $out = [System.Collections.Generic.List[object]]::new()
+    $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ N = 5 }) -SharedFunctionNames Get-ModPrivate -WorkerScript { param($N) Get-ModPrivate -N $N } -ResultHandler { param($r) $out.Add($r) }.GetNewClosure()
+    'module private=' + ($out -join ',')
+}
+Export-ModuleMember -Function Invoke-ModWork
+'@)
+$modScript = Join-Path $modDir 'use.ps1'
+[System.IO.File]::WriteAllText($modScript, ". '" + $kitPath + "'`r`nImport-Module '" + $modPath + "'`r`nInvoke-ModWork`r`n. '" + $kitPath + "'`r`n'kit modules=' + @(Get-Module -Name ParallelKit).Count`r`n")
+$modRun = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments (ConvertTo-PkArgumentString @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ("& '" + $modScript + "'"))) -TimeoutMs 60000
+Remove-Item -LiteralPath $modDir -Recurse -Force -ErrorAction SilentlyContinue
+$modOut = ([string]$modRun.Stdout + [string]$modRun.Stderr).Trim() -replace '\s+', ' '
+Test-Assert ($modOut -match 'module private=105') ("a module's private function can be shared with workers (" + $modOut + ")")
+Test-Assert ($modOut -match 'kit modules=1') "loading the kit a second time leaves one ParallelKit module, not two"
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
